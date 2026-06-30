@@ -21,7 +21,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: advert-back
-          image: ghcr.io/nulp-ai-enterprise/advert-back:latest
+          image: ghcr.io/nulp-ai-enterprise/advert-back:sha-f8fa9ee
           ports:
             - containerPort: 8080
           env:
@@ -87,17 +87,22 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /api/actuator/health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 15
           livenessProbe:
             httpGet:
               path: /api/actuator/health
               port: 8080
-            initialDelaySeconds: 30
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /api/actuator/health
               port: 8080
-            initialDelaySeconds: 30
-            periodSeconds: 10
+            periodSeconds: 5
             failureThreshold: 3
