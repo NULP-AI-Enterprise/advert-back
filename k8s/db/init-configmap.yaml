@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: advert-postgres-init
+  namespace: advert-back
+data:
+  init.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+    CREATE TABLE IF NOT EXISTS media_items (
+      id BIGSERIAL PRIMARY KEY,
+      title VARCHAR(500) NOT NULL,
+      description TEXT,
+      genre VARCHAR(100),
+      media_type VARCHAR(50),
+      release_year INT,
+      embedding vector(1536),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS user_interactions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL,
+      media_id BIGINT REFERENCES media_items(id),
+      interaction_type VARCHAR(50),
+      rating FLOAT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id BIGSERIAL PRIMARY KEY,
+      session_id VARCHAR(255) UNIQUE NOT NULL,
+      user_id VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id BIGSERIAL PRIMARY KEY,
+      session_id VARCHAR(255) REFERENCES chat_sessions(session_id),
+      role VARCHAR(20) NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_media_embedding ON media_items USING ivfflat (embedding vector_cosine_ops);
+    CREATE INDEX IF NOT EXISTS idx_user_interactions_user ON user_interactions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);

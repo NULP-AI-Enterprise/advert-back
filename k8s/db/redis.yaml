@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: advert-redis
+  namespace: advert-back
+  labels:
+    app: advert-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: advert-redis
+  template:
+    metadata:
+      labels:
+        app: advert-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: advert-redis
+  namespace: advert-back
+  labels:
+    app: advert-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: advert-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+      protocol: TCP
