@@ -4,10 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
-    paths:
-      - "src/**"
-      - "pom.xml"
-      - "Dockerfile"
 
 env:
   REGISTRY: ghcr.io
@@ -15,6 +11,7 @@ env:
 
 jobs:
   build-and-push:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -51,5 +48,14 @@ jobs:
           cache-from: type=gha
           cache-to:   type=gha,mode=max
 
-      - name: Summary
-        run: echo "Pushed ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }} and :latest"
+      - name: Pin SHA in deployment manifest
+        run: |
+          SHA="${{ steps.meta.outputs.sha_tag }}"
+          sed -i "s|image: ghcr.io/nulp-ai-enterprise/advert-back:.*|image: ghcr.io/nulp-ai-enterprise/advert-back:${SHA}|" k8s/deployment.yaml
+          git config user.email "ci@noreply.github.com"
+          git config user.name "GitHub CI"
+          git add k8s/deployment.yaml
+          git diff --staged --quiet && echo "No change to deployment.yaml" && exit 0
+          git commit -m "ci: pin image to ${SHA} [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"

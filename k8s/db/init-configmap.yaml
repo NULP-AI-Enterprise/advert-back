@@ -7,43 +7,56 @@ data:
   init.sql: |
     CREATE EXTENSION IF NOT EXISTS vector;
 
-    CREATE TABLE IF NOT EXISTS media_items (
-      id BIGSERIAL PRIMARY KEY,
-      title VARCHAR(500) NOT NULL,
-      description TEXT,
-      genre VARCHAR(100),
-      media_type VARCHAR(50),
-      release_year INT,
-      embedding vector(1536),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email VARCHAR(255) NOT NULL UNIQUE,
+        display_name VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        last_login_at TIMESTAMP WITH TIME ZONE
     );
 
-    CREATE TABLE IF NOT EXISTS user_interactions (
-      id BIGSERIAL PRIMARY KEY,
-      user_id VARCHAR(255) NOT NULL,
-      media_id BIGINT REFERENCES media_items(id),
-      interaction_type VARCHAR(50),
-      rating FLOAT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS magic_links (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id),
+        token VARCHAR(255) NOT NULL UNIQUE,
+        used BOOLEAN NOT NULL DEFAULT FALSE,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS chat_sessions (
-      id BIGSERIAL PRIMARY KEY,
-      session_id VARCHAR(255) UNIQUE NOT NULL,
-      user_id VARCHAR(255),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id VARCHAR(255) NOT NULL,
+        context JSONB,
+        title VARCHAR(255) DEFAULT 'New Chat',
+        user_ref UUID REFERENCES users(id),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS chat_messages (
-      id BIGSERIAL PRIMARY KEY,
-      session_id VARCHAR(255) REFERENCES chat_sessions(session_id),
-      role VARCHAR(20) NOT NULL,
-      content TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_id UUID NOT NULL REFERENCES chat_sessions(id),
+        role VARCHAR(20) NOT NULL,
+        content TEXT NOT NULL,
+        metadata JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_media_embedding ON media_items USING ivfflat (embedding vector_cosine_ops);
-    CREATE INDEX IF NOT EXISTS idx_user_interactions_user ON user_interactions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
+    CREATE TABLE IF NOT EXISTS media_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        title VARCHAR(500) NOT NULL,
+        description TEXT,
+        category VARCHAR(100),
+        tags TEXT[],
+        audience JSONB,
+        metrics JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session   ON chat_messages(session_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id  ON chat_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_ref ON chat_sessions(user_ref);
+    CREATE INDEX IF NOT EXISTS idx_media_items_category   ON media_items(category);
+    CREATE INDEX IF NOT EXISTS idx_magic_links_token      ON magic_links(token);
