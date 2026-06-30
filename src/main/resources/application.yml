@@ -73,7 +73,7 @@ app:
     secret: ${JWT_SECRET:change-me-in-production-min-32-chars-long}
   frontend-url: ${FRONTEND_URL:http://localhost:3000}
   websocket:
-    allowed-origins: "http://localhost:3000"
+    allowed-origins: "http://localhost:3000,https://advert.thesis-i.com"
     endpoint: /ws/chat
   redis:
     session-ttl-hours: 24
