@@ -86,6 +86,15 @@ app:
     max-pool-size: 16
     queue-capacity: 100
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
 logging:
   level:
     com.advertising: INFO
