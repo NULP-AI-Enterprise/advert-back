@@ -80,6 +80,11 @@ spec:
                 secretKeyRef:
                   name: advert-back-secret
                   key: FRONTEND_URL
+            - name: APP_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: APP_BASE_URL
           resources:
             requests:
               cpu: 200m

@@ -37,6 +37,9 @@ public class AuthService {
     @Value("${app.frontend-url}")
     private String frontendUrl;
 
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+
     @Value("${spring.mail.username:noreply@localhost}")
     private String mailFrom;
 
@@ -61,7 +64,7 @@ public class AuthService {
                     .build();
             magicLinkRepository.save(link);
 
-            String verifyUrl = "http://localhost:8080/api/auth/verify?token=" + rawToken;
+            String verifyUrl = baseUrl + "/api/auth/verify?token=" + rawToken;
 
             SimpleMailMessage message = new SimpleMailMessage();
             message.setFrom(mailFrom);
