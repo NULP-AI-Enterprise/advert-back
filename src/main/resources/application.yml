@@ -15,9 +15,9 @@ spring:
             enable: true
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/advertising_db
-    username: advertising_user
-    password: advertising_pass
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/advertising_db}
+    username: ${DB_USERNAME:advertising_user}
+    password: ${DB_PASSWORD:advertising_pass}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 20
@@ -38,8 +38,8 @@ spring:
 
   data:
     redis:
-      host: localhost
-      port: 6379
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
       timeout: 2000ms
       lettuce:
         pool:

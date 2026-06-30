@@ -21,7 +21,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: advert-back
-          image: ghcr.io/nulp-ai-enterprise/advert-back:sha-628f22c
+          image: ghcr.io/nulp-ai-enterprise/advert-back:latest
           ports:
             - containerPort: 8080
           env:
@@ -55,6 +55,36 @@ spec:
                 secretKeyRef:
                   name: advert-back-secret
                   key: REDIS_PORT
+            - name: SMTP_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: SMTP_HOST
+            - name: SMTP_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: SMTP_PORT
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: SMTP_USERNAME
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: SMTP_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: JWT_SECRET
+            - name: FRONTEND_URL
+              valueFrom:
+                secretKeyRef:
+                  name: advert-back-secret
+                  key: FRONTEND_URL
           resources:
             requests:
               cpu: 200m
