@@ -94,15 +94,18 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 10
             failureThreshold: 15
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /api/actuator/health
               port: 8080
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /api/actuator/health
               port: 8080
             periodSeconds: 5
             failureThreshold: 3
+            timeoutSeconds: 5
