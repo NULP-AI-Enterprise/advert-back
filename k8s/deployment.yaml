@@ -60,11 +60,6 @@ spec:
                 secretKeyRef:
                   name: advert-back-secret
                   key: SMTP_HOST
-            - name: SMTP_PORT
-              valueFrom:
-                secretKeyRef:
-                  name: advert-back-secret
-                  key: SMTP_PORT
             - name: SMTP_USERNAME
               valueFrom:
                 secretKeyRef:
