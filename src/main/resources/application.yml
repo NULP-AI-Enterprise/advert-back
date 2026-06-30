@@ -2,6 +2,18 @@ spring:
   application:
     name: advertising-backend
 
+  mail:
+    host: ${SMTP_HOST:smtp.gmail.com}
+    port: ${SMTP_PORT:587}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+
   datasource:
     url: jdbc:postgresql://localhost:5432/advertising_db
     username: advertising_user
@@ -57,6 +69,9 @@ openai:
   timeout-seconds: 60
 
 app:
+  jwt:
+    secret: ${JWT_SECRET:change-me-in-production-min-32-chars-long}
+  frontend-url: ${FRONTEND_URL:http://localhost:3000}
   websocket:
     allowed-origins: "http://localhost:3000"
     endpoint: /ws/chat
