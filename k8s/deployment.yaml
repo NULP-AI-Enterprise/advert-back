@@ -85,6 +85,8 @@ spec:
                 secretKeyRef:
                   name: advert-back-secret
                   key: APP_BASE_URL
+            - name: ENRICHMENT_URL
+              value: "http://advert-enrich-api.advert-enrich.svc.cluster.local:8001"
           resources:
             requests:
               cpu: 200m
