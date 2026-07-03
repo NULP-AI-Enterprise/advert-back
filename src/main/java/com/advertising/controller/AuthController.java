@@ -12,6 +12,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
@@ -61,7 +62,10 @@ public class AuthController {
                     .header(HttpHeaders.LOCATION, redirectUri.toString())
                     .build();
         } catch (ResponseStatusException e) {
-            URI errorUri = URI.create(frontendUrl + "/auth/error?reason=" + e.getReason());
+            URI errorUri = UriComponentsBuilder.fromUriString(frontendUrl)
+                    .path("/auth/error")
+                    .queryParam("reason", e.getReason() != null ? e.getReason() : "unknown")
+                    .build().toUri();
             return ResponseEntity.status(HttpStatus.FOUND)
                     .header(HttpHeaders.LOCATION, errorUri.toString())
                     .build();

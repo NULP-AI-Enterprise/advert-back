@@ -1,6 +1,8 @@
 package com.advertising.repository;
 
 import com.advertising.model.entity.MediaItem;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -55,4 +57,15 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
     @Query(value = "UPDATE media_items SET embedding = CAST(:embedding AS vector), updated_at = NOW() WHERE id = CAST(:id AS uuid)",
            nativeQuery = true)
     void updateEmbeddingById(@Param("id") String id, @Param("embedding") String embedding);
+
+    @Query("""
+        SELECT m FROM MediaItem m
+        WHERE (:search = '' OR LOWER(m.title) LIKE LOWER(CONCAT('%', :search, '%')))
+          AND (:category = '' OR m.category = :category)
+        """)
+    Page<MediaItem> findByFilters(
+        @Param("search") String search,
+        @Param("category") String category,
+        Pageable pageable
+    );
 }
