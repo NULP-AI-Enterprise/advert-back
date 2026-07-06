@@ -21,7 +21,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: advert-back
-          image: ghcr.io/nulp-ai-enterprise/advert-back:sha-ff2377f
+          image: ghcr.io/nulp-ai-enterprise/advert-back:sha-5d0fe36
           ports:
             - containerPort: 8080
           env:
