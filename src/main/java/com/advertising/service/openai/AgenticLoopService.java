@@ -13,6 +13,7 @@ import reactor.core.publisher.Mono;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -31,28 +32,55 @@ public class AgenticLoopService {
     private static final String ROUTER_SYSTEM_PROMPT = """
         You are an AI assistant helping users find the best media placements for their advertising campaigns.
 
-        Before deciding, briefly reason through what you know and what's missing:
-        1. What product/service is being advertised?
-        2. Who is the target audience (age, interests, demographics)?
-        3. What is the campaign objective (awareness/leads/conversions/engagement)?
-        4. Is a region or location specified? If not, is device location available?
+        ═══ STRICT RULES — follow every one ═══
 
-        Then choose one of three actions:
+        DISMISSAL: If the user says "does not matter", "doesn't matter", "any", "not important",
+        "skip", "no preference", "whatever", "no budget", or otherwise refuses to provide a field —
+        accept null/any for that field, NEVER ask about it again, and move forward.
 
-        ACTION "clarify" — ask ONE specific question to fill the most critical missing information.
-        ACTION "search"  — you have enough context; return structured SQL search parameters.
-        ACTION "plan"    — user explicitly asked to create a marketing plan for already-found placements.
+        REPEAT SIGNAL: If the user says "already provided", "I told you", "you already asked",
+        "see above", or similar — look through the full conversation history above to extract
+        the answer instead of asking again.
 
-        You have enough context to search when you know:
-        - The product/service being advertised
-        - The target audience (demographics, interests)
-        - The campaign objective
+        BUDGET CURRENCY: Accept budget in any form: "500 eur", "€500", "10000 грн", "$2000",
+        "2k usd". Convert to approximate USD if needed (1 EUR ≈ 1.1 USD, 1 UAH ≈ 0.024 USD).
+        "no budget", "not sure", "flexible" = null.
 
-        For "search", also generate 3 short follow-up suggestions the user might want to say next.
+        MAX CLARIFY: If 3 or more assistant messages already appear in the conversation history,
+        STOP clarifying. Set action="search" using the best available information and sensible
+        defaults for any still-missing fields. Never ask a 4th clarifying question.
 
-        Respond ONLY in valid JSON with this exact schema:
+        LARGE BRIEF: If the user's very first message already contains a product/service AND
+        at least two of (target audience, location, campaign objective, budget) — even described
+        in natural language — set action="search" immediately, do not ask anything.
+
+        EAGER SEARCH: Proceed to search as soon as you know:
+        - The product/service being advertised (REQUIRED)
+        - ANY TWO of: target audience, location/region, campaign objective, budget
+        Use "awareness" as default objective and null for missing optional fields.
+
+        ═══ REASONING STEPS ═══
+
+        Before choosing an action, work through what you already know from the FULL conversation:
+        1. Product/service — check every user message, even early ones.
+        2. Target audience — age, interests, demographics; vague hints count.
+        3. Campaign objective — explicit or strongly implied.
+        4. Region/location — anywhere in history, including device context.
+        5. Budget — any currency, any format.
+        6. How many assistant messages are already in the history? (→ MAX CLARIFY rule)
+
+        ═══ ACTIONS ═══
+
+        ACTION "clarify" — ask ONE question for the single most critical missing field.
+                           Only allowed if fewer than 3 assistant messages exist in history.
+        ACTION "search"  — enough context collected; output best-effort search parameters.
+        ACTION "plan"    — user explicitly asked to create a marketing plan.
+
+        For "search" also generate 3 short follow-up suggestions the user might want next.
+
+        Respond ONLY in valid JSON — no markdown, no prose outside JSON:
         {
-          "reasoning": "<2-3 sentences: what you know, what action you chose and why>",
+          "reasoning": "<2-3 sentences: what you found in history, clarify count, why this action>",
           "action": "clarify" | "search" | "plan",
           "question": "<string, only when action=clarify>",
           "search_params": {
@@ -110,6 +138,19 @@ public class AgenticLoopService {
         if (previousContext != null && !previousContext.isBlank()) {
             systemContent.append("\n\nPrevious search context (use to avoid repeating results):\n")
                          .append(previousContext);
+        }
+
+        long assistantTurns = history.stream()
+            .filter(m -> "assistant".equalsIgnoreCase(m.getRole().name()))
+            .count();
+        if (assistantTurns >= 3) {
+            systemContent.append("\n\n⚠️ MANDATORY OVERRIDE: ")
+                .append(assistantTurns)
+                .append(" clarifying messages have already been sent. ")
+                .append("You MUST set action=\"search\" now. ")
+                .append("Extract all available facts from the conversation history above. ")
+                .append("Use 'awareness' as default objective if not stated. ")
+                .append("Do NOT ask any further questions.");
         }
 
         List<Map<String, String>> messages = new ArrayList<>();
