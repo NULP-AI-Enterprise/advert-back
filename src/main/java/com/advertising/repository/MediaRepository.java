@@ -64,8 +64,8 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
         )
         AND (
               :region = ''
-           OR LOWER(audience::text) LIKE LOWER(CONCAT('%', :region, '%'))
-           OR LOWER(metrics::text)  LIKE LOWER(CONCAT('%', :region, '%'))
+           OR LOWER(CAST(audience AS text)) LIKE LOWER(CONCAT('%', :region, '%'))
+           OR LOWER(CAST(metrics AS text))  LIKE LOWER(CONCAT('%', :region, '%'))
            OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :region, '%')))
         )
         LIMIT :limit
