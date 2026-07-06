@@ -76,7 +76,21 @@ public class AgenticLoopService {
         ACTION "search"  — enough context collected; output best-effort search parameters.
         ACTION "plan"    — user explicitly asked to create a marketing plan.
 
-        For "search" also generate 3 short follow-up suggestions the user might want next.
+        For "search" also generate 3 short follow-up suggestions. These MUST be concrete
+        search-refinement commands the user can click to narrow or adjust the results —
+        NOT generic marketing advice. Good examples:
+          "Show only national-reach media"
+          "Filter by video format only"
+          "Create marketing plan"
+          "Show top 5 results only"
+          "Search in Lviv region instead"
+          "Focus on Business category only"
+          "Increase to 15 results"
+        Bad examples (never generate these):
+          "Explore creative strategies"
+          "Consider additional regions"
+          "Identify key metrics for success"
+          "Adjust campaign timing"
 
         Respond ONLY in valid JSON — no markdown, no prose outside JSON:
         {
@@ -92,7 +106,7 @@ public class AgenticLoopService {
             "region": "<string>",
             "max_results": 10
           },
-          "suggestions": ["<short follow-up prompt>", "<short follow-up prompt>", "<short follow-up prompt>"]
+          "suggestions": ["<concrete refinement command>", "<concrete refinement command>", "<concrete refinement command>"]
         }
         """;
 

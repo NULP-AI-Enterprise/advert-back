@@ -127,17 +127,13 @@ public class ChatService {
                     recs.setExplanation(s.request().getRelaxationNote());
                 }
 
-                WebSocketMessage textMsg = WebSocketMessage.builder()
-                    .type(WebSocketMessage.MessageType.ASSISTANT_MESSAGE)
-                    .sessionId(sessionId)
-                    .content(ctaMessage)
-                    .build();
                 WebSocketMessage recsMsg = WebSocketMessage.builder()
                     .type(WebSocketMessage.MessageType.RECOMMENDATIONS_READY)
                     .sessionId(sessionId)
+                    .content(ctaMessage)
                     .payload(recs)
                     .build();
-                return Flux.just(textMsg, recsMsg);
+                return Flux.just(recsMsg);
             });
     }
 
