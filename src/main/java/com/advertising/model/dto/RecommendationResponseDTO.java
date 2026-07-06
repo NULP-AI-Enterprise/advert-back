@@ -18,6 +18,8 @@ public class RecommendationResponseDTO {
     private List<MediaItemDTO> recommendations;
     private String explanation;
     private Map<String, Object> appliedFilters;
+    private String ctaMessage;
+    private List<String> suggestions;
 
     @Data
     @Builder

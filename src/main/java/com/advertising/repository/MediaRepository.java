@@ -52,6 +52,39 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
            nativeQuery = true)
     List<Object[]> findTopN(@Param("limit") int limit);
 
+    @Query(value = """
+        SELECT CAST(id AS text), 0.5 AS similarity
+        FROM media_items
+        WHERE (
+              :query = ''
+           OR LOWER(title)       LIKE LOWER(CONCAT('%', :query, '%'))
+           OR LOWER(description) LIKE LOWER(CONCAT('%', :query, '%'))
+           OR LOWER(category)    LIKE LOWER(CONCAT('%', :query, '%'))
+           OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :query, '%')))
+        )
+        AND (
+              :region = ''
+           OR LOWER(audience::text) LIKE LOWER(CONCAT('%', :region, '%'))
+           OR LOWER(metrics::text)  LIKE LOWER(CONCAT('%', :region, '%'))
+           OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :region, '%')))
+        )
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<Object[]> findByTextAndRegion(
+        @Param("query") String query,
+        @Param("region") String region,
+        @Param("limit") int limit
+    );
+
+    @Query(value = """
+        SELECT CAST(id AS text), 0.35 AS similarity
+        FROM media_items
+        WHERE metrics->>'reach_tier' = :reachTier
+        ORDER BY created_at DESC
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<Object[]> findByReachTier(@Param("reachTier") String reachTier, @Param("limit") int limit);
+
     @Modifying
     @Transactional
     @Query(value = "UPDATE media_items SET embedding = CAST(:embedding AS vector), updated_at = NOW() WHERE id = CAST(:id AS uuid)",

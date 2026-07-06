@@ -55,7 +55,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             case CHAT_MESSAGE -> {
                 log.info("[WS] routing CHAT_MESSAGE to ChatService, session={}", inbound.getSessionId());
                 chatService
-                    .processMessage(inbound.getSessionId(), inbound.getContent())
+                    .processMessage(inbound.getSessionId(), inbound.getContent(), inbound.getPayload())
                     .subscribe(
                         msg -> { log.info("[WS] sending response type={}", msg.getType()); send(wsSession, msg); },
                         err -> { log.error("[WS] ChatService error: {}", err.getMessage(), err); sendError(wsSession, err.getMessage()); }

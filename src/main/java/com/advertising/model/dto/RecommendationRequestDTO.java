@@ -25,6 +25,8 @@ public class RecommendationRequestDTO {
     private Double budgetUsd;
     private String campaignObjective;   // awareness | leads | conversions | engagement
     private String region;
+    private String minReachTier;        // national | regional | local | niche
+    private String relaxationNote;      // set by RecEngineService when geo is broadened
 
     private int maxResults;
 

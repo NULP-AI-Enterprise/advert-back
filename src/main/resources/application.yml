@@ -84,7 +84,7 @@ app:
     chat-history-key-prefix: "chat:session:"
   recommendation:
     max-results: 10
-    similarity-threshold: 0.35
+    context-window: 20
   async:
     core-pool-size: 4
     max-pool-size: 16

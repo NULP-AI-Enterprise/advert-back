@@ -35,6 +35,7 @@ public class WebSocketMessage {
         ASSISTANT_STREAM_END,
         RECOMMENDATIONS_READY,
         CLARIFICATION_QUESTION,
+        MARKETING_PLAN_READY,
         ERROR,
         PING,
         PONG
