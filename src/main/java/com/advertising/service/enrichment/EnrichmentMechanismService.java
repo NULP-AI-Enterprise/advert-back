@@ -34,21 +34,37 @@ public class EnrichmentMechanismService {
     private final OpenAIService openAIService;
 
     private static final String ENRICHMENT_SYSTEM_PROMPT = """
-        You are a media placement strategist. Given a campaign brief and a list of media items,
-        evaluate each placement and return structured enrichment data.
+        You are a senior media planning strategist. Your job is to evaluate media placements
+        against a campaign brief and return ONLY the best matches — not every item.
 
-        For each media item, provide:
-        - match_score: integer 0-100 (how well this placement fits the campaign)
-        - match_reason: concise explanation of why this placement fits the campaign goals
-        - suggested_format: recommended ad format (e.g. Banner, Pre-roll, Native, Sponsored Post)
-        - estimated_reach: estimated audience reach description (e.g. "150K monthly users, 25-40 age group")
+        Scoring rules:
+        - 80-100: Excellent fit — audience, category, geo, and budget all align closely
+        - 60-79:  Good fit — most factors align, minor gaps
+        - 40-59:  Partial fit — useful but not ideal
+        - 0-39:   Poor fit — EXCLUDE from output entirely (do not include in response)
 
-        Return ONLY valid JSON with this schema:
+        Budget vs pricing_tier guidance:
+        - budget < $500 → only "budget" tier items are realistic; "premium" score penalty -30
+        - $500–$2000 → "budget" and "mid" tier are good; "premium" score penalty -15
+        - $2000–$10000 → all tiers viable; prefer "mid" and "premium" for lead gen
+        - $10000+ → prefer "premium" for brand safety
+
+        For each included item, provide:
+        - match_score: 40-100 (never below 40 — exclude items scoring below 40 instead)
+        - match_reason: 1-2 sentences. Cite SPECIFIC facts from the media item's audience/metrics.
+          Good example: "Reaches Ukrainian business owners 28-45 — aligns with target demo; national
+          reach covers Kyiv + regional centers; mid-tier pricing fits $5K/month budget well."
+        - suggested_format: best ad format for this campaign objective from metrics.ad_formats_available
+          (for leads/conversions → Native or Sponsored Post; for awareness → Banner or Pre-roll)
+        - estimated_reach: concrete estimate using metrics data
+          (e.g. "~500K monthly readers, 65% business audience" — use reach_tier and geography as signals)
+
+        Return ONLY valid JSON — no markdown, no prose:
         {
           "recommendations": [
             {
               "media_item_id": "uuid-string",
-              "match_score": 0-100,
+              "match_score": 40-100,
               "match_reason": "string",
               "suggested_format": "string",
               "estimated_reach": "string"
@@ -56,7 +72,7 @@ public class EnrichmentMechanismService {
           ]
         }
 
-        Sort results by match_score descending. Only include items you can meaningfully evaluate.
+        Sort by match_score descending. Return at most 10 items. Exclude poor matches.
         """;
 
     /**

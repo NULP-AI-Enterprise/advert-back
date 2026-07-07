@@ -22,6 +22,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -192,27 +193,31 @@ public class ChatService {
         }
 
         int total = recs.size();
-        String topNames = recs.stream().limit(3)
-            .map(RecommendationResponseDTO.MediaItemDTO::getTitle)
-            .collect(Collectors.joining(", "));
-
-        int bestScore = recs.stream()
-            .mapToInt(item -> item.getMatchScore() != null ? item.getMatchScore() : 0)
-            .max().orElse(0);
-
-        String quality = bestScore >= 75 ? "Strong match" : bestScore >= 50 ? "Good match" : "Partial match";
+        RecommendationResponseDTO.MediaItemDTO top = recs.get(0);
+        int topScore = top.getMatchScore() != null ? top.getMatchScore() : 0;
+        String quality = topScore >= 80 ? "Strong match" : topScore >= 60 ? "Good match" : "Partial match";
 
         StringBuilder cta = new StringBuilder();
-        cta.append(String.format("Found %d media placement%s. %s — top results: %s.",
-            total, total == 1 ? "" : "s", quality, topNames));
+        cta.append(String.format("Found %d media placement%s. %s — top: **%s** (%d%%)",
+            total, total == 1 ? "" : "s", quality, top.getTitle(), topScore));
 
-        cta.append(" For a more precise match, tell me your ");
-        if (request.getBudgetUsd() == null) cta.append("budget, ");
-        if (request.getRegion() == null || request.getRegion().isBlank()) cta.append("target region, ");
-        cta.append("or preferred ad format.");
+        // Add top match reason snippet if available
+        if (top.getMatchReason() != null && !top.getMatchReason().isBlank()) {
+            String snippet = top.getMatchReason().length() > 90
+                ? top.getMatchReason().substring(0, 87) + "…"
+                : top.getMatchReason();
+            cta.append(". ").append(snippet);
+        }
+
+        // What would improve results
+        List<String> missing = new ArrayList<>();
+        if (request.getBudgetUsd() == null) missing.add("budget");
+        if (request.getRegion() == null || request.getRegion().isBlank()) missing.add("target region");
+        if (!missing.isEmpty()) {
+            cta.append(" For sharper results, tell me your ").append(String.join(" or ", missing)).append(".");
+        }
 
         cta.append(" I can also create a **Marketing Plan** — just say \"create marketing plan\".");
-
         return cta.toString();
     }
 

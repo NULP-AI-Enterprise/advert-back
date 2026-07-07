@@ -10,6 +10,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
+import java.util.LinkedHashMap;
 
 @Slf4j
 @Service
@@ -65,75 +66,114 @@ public class RecEngineService {
     public Mono<List<MediaItem>> findCandidates(RecommendationRequestDTO request) {
         return Mono.fromCallable(() -> sqlQuery(request))
             .subscribeOn(Schedulers.boundedElastic())
-            .doOnNext(items -> log.info("[RecEngine] {} items for session={}", items.size(), request.getSessionId()))
+            .doOnNext(items -> log.info("[RecEngine] {} candidates for session={}", items.size(), request.getSessionId()))
             .doOnError(e -> log.error("[RecEngine] query failed: {}", e.getMessage(), e));
     }
 
     private List<MediaItem> sqlQuery(RecommendationRequestDTO request) {
-        int limit = request.getMaxResults() > 0 ? request.getMaxResults() : 10;
+        int targetLimit = request.getMaxResults() > 0 ? request.getMaxResults() : 10;
+        // Over-fetch so the enrichment LLM can filter to the best N
+        int fetchLimit = Math.min(targetLimit * 3, 30);
         String region = request.getRegion() != null ? request.getRegion().trim() : "";
 
-        // Try category + region combination first
-        if (request.getCategories() != null && !request.getCategories().isEmpty()) {
-            for (String category : request.getCategories()) {
-                String keyword = mapCategoryKeyword(category);
-                List<Object[]> rows = mediaRepository.findByTextAndRegion(keyword, region, limit);
-                if (!rows.isEmpty()) {
-                    log.info("[RecEngine] category='{}' region='{}' → {} results", category, region, rows.size());
-                    return resolveItems(rows);
-                }
-            }
+        // Build keyword list: all categories + meaningful audience words
+        List<String> keywords = buildKeywords(request);
+        log.info("[RecEngine] keywords={} region='{}' fetchLimit={}", keywords, region, fetchLimit);
+
+        // Collect candidates from ALL keywords (merge + deduplicate by ID)
+        LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
+
+        for (String kw : keywords) {
+            List<Object[]> rows = mediaRepository.findByTextAndRegion(kw, region, fetchLimit);
+            resolveItems(rows).forEach(item -> pool.putIfAbsent(item.getId(), item));
+            if (pool.size() >= fetchLimit) break;
         }
 
-        // Try audience description + region
-        if (request.getTargetAudienceDescription() != null
-                && !request.getTargetAudienceDescription().isBlank()) {
-            String keyword = firstWord(request.getTargetAudienceDescription());
-            List<Object[]> rows = mediaRepository.findByTextAndRegion(keyword, region, limit);
-            if (!rows.isEmpty()) {
-                log.info("[RecEngine] audience='{}' region='{}' → {} results", keyword, region, rows.size());
-                return resolveItems(rows);
-            }
+        // If region-specific pool is thin → try geo relaxation to fill up
+        if (!region.isBlank() && pool.size() < targetLimit) {
+            List<MediaItem> relaxed = findWithGeoRelaxation(region, fetchLimit, request, keywords);
+            relaxed.forEach(item -> pool.putIfAbsent(item.getId(), item));
         }
 
-        // Geographic relaxation: try broader region
-        if (!region.isBlank()) {
-            List<MediaItem> relaxed = findWithGeoRelaxation(region, limit, request);
-            if (!relaxed.isEmpty()) return relaxed;
+        // Absolute fallback
+        if (pool.isEmpty()) {
+            log.warn("[RecEngine] no match for any keyword — falling back to top-N");
+            resolveItems(mediaRepository.findTopN(fetchLimit)).forEach(item -> pool.putIfAbsent(item.getId(), item));
         }
 
-        // Last resort: top-N newest items
-        log.warn("[RecEngine] no match — returning top-N");
-        return resolveItems(mediaRepository.findTopN(limit));
+        List<MediaItem> result = new ArrayList<>(pool.values());
+        log.info("[RecEngine] {} total candidates (target={})", result.size(), targetLimit);
+        return result;
     }
 
-    private List<MediaItem> findWithGeoRelaxation(String region, int limit, RecommendationRequestDTO request) {
+    private List<MediaItem> findWithGeoRelaxation(String region, int limit,
+                                                    RecommendationRequestDTO request,
+                                                    List<String> keywords) {
         String lowerRegion = region.toLowerCase();
+        LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
 
         // Step 1: broaden city → oblast
         String oblast = CITY_TO_OBLAST.get(lowerRegion);
         if (oblast != null) {
-            String keyword = request.getCategories() != null && !request.getCategories().isEmpty()
-                ? mapCategoryKeyword(request.getCategories().get(0))
-                : "";
-            List<Object[]> rows = mediaRepository.findByTextAndRegion(keyword, oblast, limit);
-            if (!rows.isEmpty()) {
-                log.info("[RecEngine] geo relaxation: '{}' → '{}' → {} results", region, oblast, rows.size());
+            for (String kw : keywords) {
+                resolveItems(mediaRepository.findByTextAndRegion(kw, oblast, limit))
+                    .forEach(item -> pool.putIfAbsent(item.getId(), item));
+            }
+            if (!pool.isEmpty()) {
+                log.info("[RecEngine] geo relaxation: '{}' → '{}' → {} results", region, oblast, pool.size());
                 request.setRelaxationNote("No results in " + region + " — showing " + oblast + " coverage");
-                return resolveItems(rows);
+                return new ArrayList<>(pool.values());
             }
         }
 
-        // Step 2: national reach items
+        // Step 2: national reach items (merged with keyword pool)
         List<Object[]> national = mediaRepository.findByReachTier("national", limit);
-        if (!national.isEmpty()) {
-            log.info("[RecEngine] geo relaxation: '{}' → national reach → {} results", region, national.size());
+        resolveItems(national).forEach(item -> pool.putIfAbsent(item.getId(), item));
+        if (!pool.isEmpty()) {
+            log.info("[RecEngine] geo relaxation: '{}' → national reach → {} results", region, pool.size());
             request.setRelaxationNote("No regional results for " + region + " — showing national-reach media");
-            return resolveItems(national);
+            return new ArrayList<>(pool.values());
         }
 
         return List.of();
     }
+
+    private List<String> buildKeywords(RecommendationRequestDTO request) {
+        List<String> keywords = new ArrayList<>();
+
+        // Primary: mapped category names
+        if (request.getCategories() != null) {
+            request.getCategories().stream()
+                .map(this::mapCategoryKeyword)
+                .forEach(keywords::add);
+        }
+
+        // Secondary: meaningful words from audience description (skip stopwords)
+        if (request.getTargetAudienceDescription() != null) {
+            Arrays.stream(request.getTargetAudienceDescription().split("[\\s,;]+"))
+                .map(String::toLowerCase)
+                .filter(w -> w.length() > 3)
+                .filter(w -> !AUDIENCE_STOPWORDS.contains(w))
+                .distinct()
+                .limit(4)
+                .forEach(keywords::add);
+        }
+
+        // Tertiary: campaign objective
+        if (request.getCampaignObjective() != null && !request.getCampaignObjective().isBlank()) {
+            keywords.add(request.getCampaignObjective());
+        }
+
+        // Fallback: empty string = match all
+        if (keywords.isEmpty()) keywords.add("");
+        return keywords;
+    }
+
+    private static final Set<String> AUDIENCE_STOPWORDS = Set.of(
+        "the", "and", "for", "with", "that", "this", "from", "are", "who",
+        "ages", "age", "primarily", "their", "have", "been", "they", "will",
+        "target", "audience", "demographic", "people", "users", "customers"
+    );
 
     private String mapCategoryKeyword(String category) {
         return switch (category.toLowerCase()) {
@@ -149,12 +189,6 @@ public class RecEngineService {
             case "politics"                               -> "Politics";
             default -> category;
         };
-    }
-
-    private String firstWord(String text) {
-        if (text == null || text.isBlank()) return "";
-        String trimmed = text.trim();
-        return trimmed.contains(" ") ? trimmed.substring(0, trimmed.indexOf(' ')) : trimmed;
     }
 
     private List<MediaItem> resolveItems(List<Object[]> rows) {
