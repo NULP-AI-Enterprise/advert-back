@@ -150,25 +150,32 @@ public class ChatService {
                         .build());
                 }
 
-                String prompt = """
-                    Based on the following campaign context and media placements, create a lightweight media plan.
-                    Return ONLY valid JSON:
-                    {
-                      "objective": "<one sentence campaign goal>",
-                      "placements": [
-                        { "media_title": "<title>", "suggested_format": "<format>", "budget_share_pct": <0-100> }
-                      ],
-                      "total_budget_note": "<e.g. $2,000 total — allocate as shown>",
-                      "notes": "<one sentence strategic tip>"
-                    }
-
-                    Campaign context:
-                    """ + context;
-
                 List<Map<String, String>> messages = List.of(
-                    Map.of("role", "system", "content",
-                        "You are a media planning strategist. Return only valid JSON, no markdown."),
-                    Map.of("role", "user", "content", prompt)
+                    Map.of("role", "system", "content", """
+                        You are a pragmatic, data-driven media planning strategist with deep knowledge
+                        of the Ukrainian media market. Your goal is to synthesize raw media placements
+                        into a cohesive, actionable marketing plan — not a generic one.
+
+                        Rules:
+                        - Allocate budget_share_pct so the sum across all placements equals 100.
+                        - Prioritise high-traffic outlets with strong audience alignment.
+                        - Suggest the format that best serves the campaign objective for each outlet.
+                        - The `notes` field must contain ONE concrete, non-obvious strategic tip
+                          (e.g. "Publish on Tuesday morning — Ukrainian tech audiences peak 9-11am").
+                        - Return ONLY valid JSON, no markdown, no prose outside the JSON object.
+
+                        Output schema (strict):
+                        {
+                          "objective": "<one sentence campaign goal>",
+                          "placements": [
+                            { "media_title": "<title>", "suggested_format": "<format>", "budget_share_pct": <integer 0-100> }
+                          ],
+                          "total_budget_note": "<e.g. $2,000 total — 3 placements as shown>",
+                          "notes": "<one concrete, specific strategic tip>"
+                        }
+                        """),
+                    Map.of("role", "user", "content",
+                        "Create a media plan for the following campaign:\n\n" + context)
                 );
 
                 return openAIService.chatCompletionJson(messages)

@@ -108,6 +108,42 @@ public class OpenAIService {
     }
 
     /**
+     * Structured-output completion — guarantees the response matches the provided JSON Schema.
+     * Uses OpenAI's json_schema response_format with strict=true.
+     * Eliminates prompt-based JSON description and prevents hallucinated field names.
+     */
+    public Mono<JsonNode> chatCompletionStructured(
+            List<Map<String, String>> messages,
+            String schemaName,
+            JsonNode schema) {
+
+        ObjectNode body = buildChatRequestBody(messages, false);
+        ObjectNode responseFormat = body.putObject("response_format");
+        responseFormat.put("type", "json_schema");
+        ObjectNode jsonSchema = responseFormat.putObject("json_schema");
+        jsonSchema.put("name", schemaName);
+        jsonSchema.put("strict", true);
+        jsonSchema.set("schema", schema);
+
+        return webClient.post()
+            .uri("/chat/completions")
+            .bodyValue(body)
+            .retrieve()
+            .bodyToMono(JsonNode.class)
+            .map(response -> {
+                String content = response
+                    .path("choices").get(0)
+                    .path("message").path("content").asText();
+                try {
+                    return objectMapper.readTree(content);
+                } catch (Exception e) {
+                    throw new RuntimeException("OpenAI structured output returned invalid JSON: " + content, e);
+                }
+            })
+            .doOnError(e -> log.error("OpenAI structured completion failed: {}", e.getMessage()));
+    }
+
+    /**
      * Generates an embedding vector for the provided text.
      * Used for pgvector similarity search.
      */

@@ -4,6 +4,7 @@ import com.advertising.model.dto.RecommendationRequestDTO;
 import com.advertising.model.entity.ChatMessage;
 import com.advertising.service.chat.ChatHistoryService;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -22,6 +23,7 @@ public class AgenticLoopService {
 
     private final OpenAIService openAIService;
     private final ChatHistoryService chatHistoryService;
+    private final ObjectMapper objectMapper;
 
     @Value("${app.recommendation.max-results}")
     private int defaultMaxResults;
@@ -29,157 +31,185 @@ public class AgenticLoopService {
     @Value("${app.recommendation.context-window:20}")
     private int contextWindow;
 
+    // ── JSON Schema for Structured Outputs ────────────────────────────────────
+    // Strict mode: all fields required, nullable via ["type","null"], no extra keys.
+    // This replaces the JSON description block that was previously in the prompt text.
+
+    private static final String ROUTER_SCHEMA_JSON = """
+        {
+          "type": "object",
+          "properties": {
+            "reasoning":    { "type": "string" },
+            "action":       { "type": "string" },
+            "question":     { "type": ["string", "null"] },
+            "search_params": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "categories":                   { "type": "array",  "items": { "type": "string" } },
+                    "keywords":                     { "type": "array",  "items": { "type": "string" } },
+                    "target_audience_description":  { "type": ["string", "null"] },
+                    "age_range": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "min": { "type": ["integer", "null"] },
+                            "max": { "type": ["integer", "null"] }
+                          },
+                          "required": ["min", "max"],
+                          "additionalProperties": false
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "budget_usd":           { "type": ["number",  "null"] },
+                    "campaign_objective":   { "type": ["string",  "null"] },
+                    "format_preference":    { "type": ["string",  "null"] },
+                    "event_date":           { "type": ["string",  "null"] },
+                    "region":               { "type": ["string",  "null"] },
+                    "country":              { "type": ["string",  "null"] },
+                    "max_results":          { "type": "integer" }
+                  },
+                  "required": [
+                    "categories","keywords","target_audience_description","age_range",
+                    "budget_usd","campaign_objective","format_preference","event_date",
+                    "region","country","max_results"
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            },
+            "suggestions": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["reasoning","action","question","search_params","suggestions"],
+          "additionalProperties": false
+        }
+        """;
+
+    private JsonNode routerSchema;
+
+    @jakarta.annotation.PostConstruct
+    void init() {
+        try {
+            routerSchema = objectMapper.readTree(ROUTER_SCHEMA_JSON);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to parse router JSON schema", e);
+        }
+    }
+
+    // ── Prompt ─────────────────────────────────────────────────────────────────
+
     private static final String ROUTER_SYSTEM_PROMPT = """
         You are an AI assistant helping users find the best media placements for their advertising campaigns.
 
-        ═══ STRICT RULES — follow every one ═══
+        ═══ STRICT RULES ═══
 
-        DISMISSAL: If the user says "does not matter", "doesn't matter", "any", "not important",
-        "skip", "no preference", "whatever", "no budget", or otherwise refuses to provide a field —
-        accept null/any for that field, NEVER ask about it again, and move forward.
+        DISMISSAL: Treat user indifference expressions ("any", "skip", "no preference",
+        "does not matter", "no budget", "flexible", "not sure") as explicit NULL values
+        for that field. Set it to null and proceed — never ask about it again.
 
         REPEAT SIGNAL: If the user says "already provided", "I told you", "you already asked",
-        "see above", or similar — look through the full conversation history above to extract
-        the answer instead of asking again.
+        or similar — look through the full conversation history to extract the answer.
 
-        BUDGET CURRENCY: Accept budget in any form: "500 eur", "€500", "10000 грн", "$2000",
-        "2k usd". Convert to approximate USD if needed (1 EUR ≈ 1.1 USD, 1 UAH ≈ 0.024 USD).
-        "no budget", "not sure", "flexible" = null.
+        BUDGET CURRENCY: Accept any format: "500 eur", "€500", "10000 грн", "$2000", "2k usd".
+        Convert to USD (1 EUR ≈ 1.1 USD, 1 UAH ≈ 0.024 USD). Indifference expressions → null.
 
-        MAX CLARIFY: If 3 or more assistant messages already appear in the conversation history,
-        STOP clarifying. Set action="search" using the best available information and sensible
-        defaults for any still-missing fields. Never ask a 4th clarifying question.
+        MAX CLARIFY: You have been given CURRENT_CLARIFY_COUNT (the number of assistant
+        clarifying turns already sent). If CURRENT_CLARIFY_COUNT >= 3 → set action="search"
+        immediately using best available information. Never send a 4th clarifying question.
 
-        LARGE BRIEF: If the user's very first message already contains a product/service AND
-        at least two of (target audience, location, campaign objective, budget, format) —
-        even described in natural language — set action="search" immediately, do not ask anything.
+        LARGE BRIEF: If the user's first message contains a product/service PLUS at least
+        two of (audience, location, objective, budget, format) — set action="search" at once.
 
         EAGER SEARCH: Proceed to search as soon as you know:
         - The product/service being advertised (REQUIRED)
-        - ANY TWO of: target audience, location/region, campaign objective, budget, format
-        Use "awareness" as default objective and null for missing optional fields.
+        - ANY TWO of: audience, location, objective, budget, format
+        Default objective: "awareness". Missing optional fields → null.
 
-        CLARIFY PRIORITY — when you must ask ONE question, combine the most critical gaps:
-        1. If budget AND format are both unknown: ask both in a single question, e.g.
-           "What's your budget and preferred content format — Article, Press Release, or Video?"
-        2. If only budget unknown: ask budget.
-        3. If only format unknown: ask format.
-        4. Otherwise ask about the most impactful remaining field.
-        Never ask about a field the user already answered or dismissed.
+        CLARIFY PRIORITY — when you must ask exactly ONE question:
+        1. Budget AND format both unknown → combine: "What's your budget and preferred format
+           — Article, Press Release, Paid news, or Video?"
+        2. Only budget unknown → ask budget.
+        3. Only format unknown → ask format.
+        4. Otherwise ask about the single most impactful missing field.
 
         ═══ REASONING STEPS ═══
 
-        Before choosing an action, work through what you already know from the FULL conversation:
-        1. Product/service — check every user message, even early ones.
-        2. Target audience — age, interests, demographics; vague hints count.
-        3. Campaign objective — explicit or strongly implied.
-        4. Region/location — anywhere in history, including device context.
-        5. Budget — any currency, any format.
-        6. Format preference — Article, Press Release, Paid news, Video, or not specified.
-        7. Event date — if this is a timed event, extract the date if mentioned.
-        8. How many assistant messages are already in the history? (→ MAX CLARIFY rule)
+        Check the FULL conversation before deciding:
+        1. Product/service — scan every user message.
+        2. Audience — age, interests, demographics; vague hints count.
+        3. Objective — explicit or strongly implied.
+        4. Region/location — any message, including device context.
+        5. Budget — any currency or format.
+        6. Format preference — Article / Press Release / Paid news / Video.
+        7. Event date — extract if this is a timed event.
+        8. CURRENT_CLARIFY_COUNT — read the injected value, do not count yourself.
 
         ═══ ACTIONS ═══
 
-        ACTION "clarify" — ask ONE question covering the 1-2 most critical missing fields.
-                           Only allowed if fewer than 3 assistant messages exist in history.
-        ACTION "search"  — enough context collected; output best-effort search parameters.
-        ACTION "plan"    — user explicitly asked to create a marketing plan.
+        action="clarify" — ONE question covering 1-2 critical missing fields.
+                           Only if CURRENT_CLARIFY_COUNT < 3.
+        action="search"  — output structured search parameters.
+        action="plan"    — user explicitly asked for a marketing plan.
 
-        For "search" also generate 3 short follow-up suggestions. These MUST be concrete
-        search-refinement commands the user can click to narrow or adjust the results —
-        NOT generic marketing advice. Good examples:
-          "Show only national-reach media"
+        For action="search" return 3 suggestions — CONCRETE refinement commands, e.g.:
           "Filter by Article format only"
-          "Filter by Press Release only"
           "Filter by Video format only"
-          "Create marketing plan"
-          "Show top 5 results only"
-          "Search in Lviv region instead"
-          "Focus on Business category only"
-          "Increase to 15 results"
+          "Show only national-reach media"
+          "Focus on Technology category only"
           "Set budget to $500"
-        Bad examples (never generate these):
-          "Explore creative strategies"
-          "Consider additional regions"
-          "Identify key metrics for success"
-          "Adjust campaign timing"
+          "Search in Kyiv region instead"
+          "Increase to 15 results"
+          "Create marketing plan"
+        Never suggest vague advice like "Explore creative strategies".
 
         ═══ CATEGORY CLASSIFICATION ═══
 
-        When classifying the product/service into categories, use ONLY these canonical values:
+        Canonical values only:
         News | Business | Technology | Sports | Fashion | Agriculture | Video | Entertainment | Science | Politics
 
-        Map broadly: fintech/crypto/blockchain/web3/SaaS/AI → Technology
-                     finance/investment/insurance/real estate/B2B → Business
-                     health/medicine/biotech → Science
-                     politics/government/NGO → Politics
-        If the topic spans multiple categories, return up to 3 best matches.
+        Map broadly:
+          fintech/crypto/blockchain/web3/SaaS/AI/drones/hardware → Technology
+          finance/investment/insurance/real estate/B2B           → Business
+          health/medicine/biotech                                 → Science
+          politics/government/NGO                                 → Politics
+        Return up to 3 best-matching categories.
 
-        ALSO extract `keywords`: 5-8 specific topic terms that drive full-text search against
-        a database of media outlet titles, URLs, descriptions, and tags.
+        ═══ KEYWORD RULES ═══
 
-        KEYWORD RULES — follow all of them:
-        1. Every keyword MUST be at least 4 characters long. Never include 2-3 letter terms
-           like "AI", "IT", "ML", "AR", "VR", "B2B" — they produce too many false positives.
-        2. Spell out abbreviations: "AI" → "artificial intelligence" AND "machine learning";
-           "IT" → "technology" AND "digital" AND "software"; "ML" → "machine learning".
-        3. Include DOMAIN-FRIENDLY terms: words likely to appear in a media site's name or URL.
-           For Technology: always include "tech", "digital", "software", "startup".
-           For Business: always include "business", "finance", "economic".
-           For Science: always include "science", "research".
-        4. Include both the specific topic AND broader synonyms:
-           e.g. "drones" → also "drone", "aviation", "aerospace", "UAV technologies"
-                "crypto" → also "blockchain", "digital assets"
-        5. Return 5-8 keywords total. Prefer longer, more specific terms over short generic ones.
+        Extract 5-8 keywords for full-text search against outlet titles, URLs, descriptions, tags.
+        1. Minimum 4 characters — never "AI", "IT", "ML", "AR", "VR", "B2B".
+        2. Spell out: "AI" → "artificial intelligence" + "machine learning";
+           "IT" → "technology" + "digital" + "software"; "ML" → "machine learning".
+        3. Domain-friendly terms (likely in site names/URLs):
+           Technology → "tech", "digital", "software", "startup"
+           Business   → "business", "finance", "economic"
+           Science    → "science", "research"
+        4. Specific + synonyms: "drones" → also "drone", "aviation", "aerospace", "UAV".
+        5. Prefer longer specific terms over short generic ones.
 
         ═══ FORMAT EXTRACTION ═══
 
-        Extract `format_preference` if the user specifies a content type:
-        - "Article" — editorial or sponsored article
-        - "Press Release" — formal press release
-        - "Paid news" — paid news placement
-        - "Video" — video content placement
-        - "any" — no preference (default when not mentioned)
+        Map to: "Article" | "Press Release" | "Paid news" | "Video" | null (no preference).
+        "стаття"/"article"/"post" → "Article"
+        "відео"/"video"          → "Video"
+        "прес-реліз"             → "Press Release"
+        "новина"/"news"          → "Paid news"
 
-        Map naturally: "стаття"/"article"/"post" → "Article"; "відео"/"video" → "Video";
-        "прес-реліз"/"press release" → "Press Release"; "новина"/"news" → "Paid news".
+        ═══ EVENT DATE ═══
 
-        ═══ EVENT DATE EXTRACTION ═══
+        If the campaign is for a timed event, extract event_date as YYYY-MM-DD.
+        Leave null if no date mentioned.
 
-        If the campaign is for a timed event (conference, product launch, festival, etc.),
-        extract `event_date` as an ISO date string (YYYY-MM-DD) if a date is mentioned.
-        This helps filter outlets by their lead time — if event_date is close, outlets
-        requiring long lead times will be flagged. Leave null if no date is mentioned.
+        ═══ GEO ═══
 
-        ═══ GEO EXTRACTION ═══
-
-        Extract TWO geo fields:
-        - `region`: the most specific location mentioned (city, district, state)
-        - `country`: the country
-        Both are optional. If only a country is mentioned, leave `region` null.
-
-        Respond ONLY in valid JSON — no markdown, no prose outside JSON:
-        {
-          "reasoning": "<2-3 sentences: what you found in history, clarify count, why this action>",
-          "action": "clarify" | "search" | "plan",
-          "question": "<string, only when action=clarify>",
-          "search_params": {
-            "categories": ["<canonical category>"],
-            "keywords": ["<topic term>"],
-            "target_audience_description": "<string>",
-            "age_range": { "min": 0, "max": 0 },
-            "budget_usd": 0,
-            "campaign_objective": "awareness|leads|conversions|engagement",
-            "format_preference": "Article|Press Release|Paid news|Video|any",
-            "event_date": "<YYYY-MM-DD or null>",
-            "region": "<city or district, or null>",
-            "country": "<country name, or null>",
-            "max_results": 10
-          },
-          "suggestions": ["<concrete refinement command>", "<concrete refinement command>", "<concrete refinement command>"]
-        }
+        region: most specific location (city/district). country: the country. Both nullable.
         """;
+
+    // ── Public API ─────────────────────────────────────────────────────────────
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage,
                                       String deviceLocation, String deviceLanguage,
@@ -187,10 +217,13 @@ public class AgenticLoopService {
         log.info("[Agentic] decide() session={}", sessionId);
         return chatHistoryService.getRecentHistory(sessionId, contextWindow)
             .flatMap(history -> {
-                log.info("[Agentic] history={} msgs, calling OpenAI", history.size());
+                long clarifyCount = history.stream()
+                    .filter(m -> "assistant".equalsIgnoreCase(m.getRole().name()))
+                    .count();
+                log.info("[Agentic] history={} msgs, clarifyCount={}, calling OpenAI", history.size(), clarifyCount);
                 List<Map<String, String>> messages = buildMessageList(
-                    history, userMessage, deviceLocation, deviceLanguage, previousContext);
-                return openAIService.chatCompletionJson(messages);
+                    history, userMessage, deviceLocation, deviceLanguage, previousContext, clarifyCount);
+                return openAIService.chatCompletionStructured(messages, "router_response", routerSchema);
             })
             .map(json -> {
                 String reasoning = json.path("reasoning").asText("");
@@ -200,20 +233,28 @@ public class AgenticLoopService {
             .doOnError(e -> log.error("[Agentic] OpenAI call failed: {}", e.getMessage(), e));
     }
 
-    // Backward-compatible overload
     public Mono<AgentDecision> decide(String sessionId, String userMessage) {
         return decide(sessionId, userMessage, null, null, null);
     }
 
+    // ── Internal ────────────────────────────────────────────────────────────────
+
     private List<Map<String, String>> buildMessageList(
             List<ChatMessage> history, String newUserMessage,
-            String deviceLocation, String deviceLanguage, String previousContext) {
+            String deviceLocation, String deviceLanguage,
+            String previousContext, long clarifyCount) {
 
         StringBuilder systemContent = new StringBuilder(ROUTER_SYSTEM_PROMPT);
 
+        // Inject count as explicit variable — model reads it, never counts itself
+        systemContent.append("\n\nCURRENT_CLARIFY_COUNT: ").append(clarifyCount);
+        if (clarifyCount >= 3) {
+            systemContent.append(" ← LIMIT REACHED. You MUST set action=\"search\" now.");
+        }
+
         if ((deviceLocation != null && !deviceLocation.isBlank())
                 || (deviceLanguage != null && !deviceLanguage.isBlank())) {
-            systemContent.append("\nDevice context (use as fallback if user hasn't specified):");
+            systemContent.append("\n\nDevice context (fallback if user hasn't specified):");
             if (deviceLocation != null && !deviceLocation.isBlank())
                 systemContent.append("\n- Location: ").append(deviceLocation);
             if (deviceLanguage != null && !deviceLanguage.isBlank())
@@ -221,21 +262,8 @@ public class AgenticLoopService {
         }
 
         if (previousContext != null && !previousContext.isBlank()) {
-            systemContent.append("\n\nPrevious search context (use to avoid repeating results):\n")
+            systemContent.append("\n\nPrevious search context (avoid repeating results):\n")
                          .append(previousContext);
-        }
-
-        long assistantTurns = history.stream()
-            .filter(m -> "assistant".equalsIgnoreCase(m.getRole().name()))
-            .count();
-        if (assistantTurns >= 3) {
-            systemContent.append("\n\n⚠️ MANDATORY OVERRIDE: ")
-                .append(assistantTurns)
-                .append(" clarifying messages have already been sent. ")
-                .append("You MUST set action=\"search\" now. ")
-                .append("Extract all available facts from the conversation history above. ")
-                .append("Use 'awareness' as default objective if not stated. ")
-                .append("Do NOT ask any further questions.");
         }
 
         List<Map<String, String>> messages = new ArrayList<>();
@@ -263,17 +291,15 @@ public class AgenticLoopService {
             RecommendationRequestDTO.RecommendationRequestDTOBuilder builder =
                 RecommendationRequestDTO.builder().sessionId(sessionId);
 
-            if (params.has("categories")) {
+            if (params.has("categories") && !params.path("categories").isNull()) {
                 List<String> cats = new ArrayList<>();
                 params.path("categories").forEach(n -> cats.add(n.asText()));
                 builder.categories(cats);
             }
 
-            if (params.has("keywords")) {
+            if (params.has("keywords") && !params.path("keywords").isNull()) {
                 List<String> kws = new ArrayList<>();
                 params.path("keywords").forEach(n -> kws.add(n.asText()));
-                // Hard filter: remove short terms that produce LIKE false-positives.
-                // "AI" → LIKE '%ai%' matches "mail", "detail", "social media" etc.
                 kws.removeIf(k -> k == null || k.trim().length() < 4);
                 if (!kws.isEmpty()) builder.keywords(kws);
             }
@@ -290,20 +316,22 @@ public class AgenticLoopService {
                     .build());
             }
 
-            if (params.has("budget_usd") && !params.path("budget_usd").isNull())
-                builder.budgetUsd(params.path("budget_usd").asDouble());
+            JsonNode budgetNode = params.path("budget_usd");
+            if (!budgetNode.isNull() && !budgetNode.isMissingNode())
+                builder.budgetUsd(budgetNode.asDouble());
 
             String objective = params.path("campaign_objective").asText(null);
             if (objective != null && !objective.isBlank()) builder.campaignObjective(objective);
 
             String region = params.path("region").asText(null);
-            if (region != null && !region.isBlank()) builder.region(region);
+            if (region != null && !region.isBlank() && !"null".equals(region)) builder.region(region);
 
             String country = params.path("country").asText(null);
-            if (country != null && !country.isBlank()) builder.country(country);
+            if (country != null && !country.isBlank() && !"null".equals(country)) builder.country(country);
 
             String format = params.path("format_preference").asText(null);
-            if (format != null && !format.isBlank() && !"any".equalsIgnoreCase(format))
+            if (format != null && !format.isBlank() && !"null".equalsIgnoreCase(format)
+                    && !"any".equalsIgnoreCase(format))
                 builder.formatPreference(format);
 
             String eventDate = params.path("event_date").asText(null);
@@ -320,6 +348,8 @@ public class AgenticLoopService {
             "Could you tell me more about your campaign goals?"
         ));
     }
+
+    // ── Decision type ───────────────────────────────────────────────────────────
 
     public sealed interface AgentDecision permits AgentDecision.Clarify, AgentDecision.Search, AgentDecision.Plan {
 

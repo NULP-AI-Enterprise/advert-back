@@ -5,12 +5,14 @@ import com.advertising.model.dto.RecommendationResponseDTO;
 import com.advertising.model.entity.MediaItem;
 import com.advertising.service.openai.OpenAIService;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
-import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 
 /**
@@ -24,11 +26,54 @@ import java.util.*;
 public class EnrichmentMechanismService {
 
     private final OpenAIService openAIService;
+    private final ObjectMapper objectMapper;
+
+    // ── JSON Schema for Structured Outputs ─────────────────────────────────────
+
+    private static final String ENRICHMENT_SCHEMA_JSON = """
+        {
+          "type": "object",
+          "properties": {
+            "reasoning": { "type": "string" },
+            "recommendations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "media_item_id":   { "type": "string" },
+                  "match_score":     { "type": "integer" },
+                  "match_reason":    { "type": "string" },
+                  "suggested_format":{ "type": "string" },
+                  "estimated_reach": { "type": "string" },
+                  "budget_fit":      { "type": "string" }
+                },
+                "required": ["media_item_id","match_score","match_reason","suggested_format","estimated_reach","budget_fit"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["reasoning","recommendations"],
+          "additionalProperties": false
+        }
+        """;
+
+    private JsonNode enrichmentSchema;
+
+    @jakarta.annotation.PostConstruct
+    void init() {
+        try {
+            enrichmentSchema = objectMapper.readTree(ENRICHMENT_SCHEMA_JSON);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to parse enrichment JSON schema", e);
+        }
+    }
+
+    // ── System Prompt ───────────────────────────────────────────────────────────
 
     private static final String SYSTEM_PROMPT = """
         You are a senior media planning strategist for the Ukrainian market.
-        Your job is to evaluate PR placement opportunities against a campaign brief
-        and return ONLY the best matches — not every candidate.
+        Evaluate PR placement opportunities against a campaign brief and return ONLY the
+        best matches — not every candidate. Be decisive: if an outlet doesn't fit, exclude it.
 
         You have access to REAL data for each outlet:
         - cost_usd: actual placement price from the PR marketplace
@@ -36,102 +81,86 @@ public class EnrichmentMechanismService {
         - ahrefs_dr / moz_da: SEO authority scores
         - format_type: placement format (Article, Press Release, Paid news, Video, etc.)
         - language: publication language
-        - lead_time_hours: how many hours in advance the placement must be booked
-        - restrictions: content categories allowed or restricted
+        - lead_time_hours: advance booking required (pre-computed feasibility also provided)
+        - restrictions: explicit content rules (see below)
 
-        ═══ SCORING RULES ═══
+        ═══ SCORING ═══
 
-        - 80-100: Excellent fit — cost, audience, category, format, and restrictions all align
-        - 60-79:  Good fit — most factors align, minor gaps
-        - 40-59:  Partial fit — useful but not ideal
-        - < 30:   Poor fit — EXCLUDE entirely (do not include in response)
+        80-100: Excellent — cost, audience, category, format, restrictions all align
+        60-79:  Good — most factors align, minor gaps
+        40-59:  Partial — useful but not ideal
+        < 30:   Poor — EXCLUDE (omit from response entirely)
 
-        The exclusion threshold is 30. Include marginal candidates — a missed result is worse
-        than an extra mediocre one. The user can always filter further.
+        Exclusion threshold is 30. A missed relevant result is worse than one extra mediocre one.
 
-        ═══ BUDGET GUIDANCE ═══
+        ═══ BUDGET ═══
 
-        Use exact cost_usd values, never vague tiers:
+        Use exact cost_usd — never vague tiers:
         - cost_usd > budget × 0.5 → flag as expensive, reduce score by 20
-        - cost_usd > budget → EXCLUDE unless outlet is exceptionally strong (score 85+)
-        - No budget specified → do not penalize any outlet for cost; mention cost in reasoning
+        - cost_usd > budget → EXCLUDE unless score would otherwise be 85+
+        - No budget specified → never penalize for cost; mention cost in reasoning
 
         ═══ FORMAT MATCHING ═══
 
-        If the campaign brief specifies a format_preference:
-        - Exact match (outlet format_type = preference) → boost score +10
-        - No format_preference specified → use objective to suggest best format:
-          leads/conversions → "Article" or "Paid news"
-          awareness → "Press Release" or "Article"
-          engagement → "Video" if available, else "Article"
-        - Always return the best available format in suggested_format
+        If format_preference is set in the brief:
+        - Outlet format_type matches preference → boost +10
+        - No preference → suggest best format by objective:
+          leads/conversions → Article or Paid news
+          awareness → Press Release or Article
+          engagement → Video if available, else Article
 
-        ═══ EVENT DATE / LEAD TIME CHECK ═══
+        ═══ LEAD TIME FEASIBILITY ═══
 
-        If event_date is provided in the brief:
-        - Calculate days until event from today's date
-        - If outlet's lead_time_hours / 24 > days_until_event → flag as "may be too late to book"
-        - If lead_time feasible → boost score +5 and mention it in match_reason
+        Each outlet now includes a pre-computed "Booking feasible" flag.
+        - feasible=YES → mention it as a positive signal, boost +5
+        - feasible=NO  → flag in match_reason as "booking may be too late"; reduce score by 15
 
-        ═══ RESTRICTION CHECK ═══
+        ═══ RESTRICTIONS ═══
 
-        - ONLY EXCLUDE if the specific content type is EXPLICITLY set to false in restrictions
-          (e.g., restrictions contains crypto: false → crypto content is FORBIDDEN).
-        - Key ABSENT from restrictions or restrictions is empty → content is PERMITTED.
-          Absence means "not restricted", NOT "not allowed". Do NOT exclude.
-        - Key is true → content explicitly ALLOWED, boost score by +5.
+        The restrictions map contains explicit content rules. Follow this decision tree exactly:
+
+        1. Key is ABSENT or restrictions is empty → content is PERMITTED. Do NOT exclude.
+        2. Key is present with value TRUE  → content EXPLICITLY ALLOWED. Boost score +5.
+        3. Key is present with value FALSE → content FORBIDDEN. EXCLUDE the outlet.
+
+        Read each restriction key carefully. If the campaign topic does not appear in
+        restrictions at all, the outlet is safe to include.
 
         ═══ PRE-ENRICHMENT HANDLING ═══
 
-        Some outlets may have no description, tags, or audience data (still being enriched).
-        In that case, infer editorial focus from NAME and URL:
-          "ain.ua" → Ukrainian tech/startup news (Technology)
-          "itc.ua" → Ukrainian IT media (Technology)
-          "dou.ua" → Ukrainian developers community (Technology)
-          "tsn.ua" → national Ukrainian TV news (broad reach)
+        Some outlets have no description/tags yet. Infer editorial focus from name and URL:
+          "ain.ua"   → Ukrainian tech/startup news (Technology)
+          "itc.ua"   → Ukrainian IT media (Technology)
+          "dou.ua"   → Ukrainian developer community (Technology)
+          "tsn.ua"   → national Ukrainian TV news (broad reach)
           "unian.ua" → national Ukrainian news agency
-        Apply broadly: a .ua domain with "tech", "it", "digit", "soft", "start", "code",
-        "dev", "data" in its name → treat as Technology outlet.
-        High-traffic national outlets (similarweb_visits > 1M) without description: base score 60.
-        Unknown/medium outlets without description: base score 50.
-        NEVER score below 30 solely because description is missing.
+        Broadly: .ua domain with "tech", "it", "digit", "soft", "start", "code", "dev",
+        "data" in name → Technology outlet.
+        Outlets with similarweb_visits > 1M and no description: base score 60.
+        All other unenriched outlets: base score 50.
+        Never score below 30 solely because description is missing.
 
-        ═══ OUTPUT FORMAT ═══
+        ═══ REQUIRED OUTPUT PER RECOMMENDATION ═══
 
-        For each included item provide:
-        - match_score: 30-100
-        - match_reason: 2-3 sentences citing SPECIFIC data points. Always mention:
-            • Traffic (e.g. "1.6M monthly visits, DR=77")
-            • Cost vs budget (e.g. "$130 of $2000 — 6.5% of budget")
-            • Why the audience matches the campaign
-            • Format suitability and lead time feasibility if event_date was given
-        - suggested_format: best format for this campaign (use format_type values available)
-        - estimated_reach: concrete estimate, e.g. "~1.6M monthly readers, national Ukraine"
-        - budget_fit: short budget analysis, e.g. "$130 of $2000 — fits 15× per month"
+        match_reason: 2-3 sentences citing SPECIFIC numbers. Must include:
+          • Traffic: e.g. "1.6M monthly visits, DR=77"
+          • Cost vs budget: e.g. "$130 of $2000 — 6.5%"
+          • Why audience/topic matches
+          • If event_date given: mention booking feasibility
+        suggested_format: best format from available format_type values
+        estimated_reach: concrete, e.g. "~1.6M monthly readers, national Ukraine"
+        budget_fit: short line, e.g. "$130 of $2000 — fits 15× per month"
 
-        Also return a top-level `reasoning` field (3-5 sentences) explaining:
-        - What the overall budget allows across selected placements
-        - Why the selected outlets match the target audience and campaign objective
-        - Format strategy — which formats were chosen and why
-        - Any notable trade-offs, timing risks, or gaps
-
-        Return ONLY valid JSON — no markdown, no prose:
-        {
-          "reasoning": "string",
-          "recommendations": [
-            {
-              "media_item_id": "uuid-string",
-              "match_score": 30-100,
-              "match_reason": "string",
-              "suggested_format": "string",
-              "estimated_reach": "string",
-              "budget_fit": "string"
-            }
-          ]
-        }
+        Top-level `reasoning` (3-5 sentences):
+          • What the budget allows
+          • Why selected outlets match audience and objective
+          • Format strategy rationale
+          • Trade-offs, timing risks, or gaps
 
         Sort recommendations by match_score descending. Return at most 10 items.
         """;
+
+    // ── Public API ──────────────────────────────────────────────────────────────
 
     public Mono<RecommendationResponseDTO> enrich(
             List<MediaItem> rawCandidates,
@@ -148,9 +177,15 @@ public class EnrichmentMechanismService {
         log.info("[Enrichment] enriching {} candidates for session={}",
             rawCandidates.size(), request.getSessionId());
 
-        List<Map<String, String>> messages = buildMessages(rawCandidates, request);
+        // Compute event date context once — reused for all outlets in prompt building
+        EventDateContext eventCtx = parseEventDate(request.getEventDate());
 
-        return openAIService.chatCompletionJson(messages)
+        List<Map<String, String>> messages = List.of(
+            Map.of("role", "system", "content", SYSTEM_PROMPT),
+            Map.of("role", "user",   "content", buildUserPrompt(rawCandidates, request, eventCtx))
+        );
+
+        return openAIService.chatCompletionStructured(messages, "enrichment_response", enrichmentSchema)
             .map(json -> buildResponse(json, rawCandidates, request.getSessionId()))
             .doOnNext(resp -> log.info("[Enrichment] {} recommendations for session={}",
                 resp.getRecommendations().size(), request.getSessionId()))
@@ -158,80 +193,64 @@ public class EnrichmentMechanismService {
             .onErrorReturn(buildFallbackResponse(rawCandidates, request.getSessionId()));
     }
 
-    private List<Map<String, String>> buildMessages(
-            List<MediaItem> candidates, RecommendationRequestDTO request) {
-        return List.of(
-            Map.of("role", "system", "content", SYSTEM_PROMPT),
-            Map.of("role", "user",   "content", buildUserPrompt(candidates, request))
-        );
-    }
+    // ── Prompt building ─────────────────────────────────────────────────────────
 
-    private String buildUserPrompt(List<MediaItem> candidates, RecommendationRequestDTO request) {
+    private String buildUserPrompt(List<MediaItem> candidates, RecommendationRequestDTO request,
+                                   EventDateContext eventCtx) {
         StringBuilder sb = new StringBuilder();
 
         sb.append("## Campaign Brief\n");
-        if (request.getCategories() != null && !request.getCategories().isEmpty()) {
+        if (request.getCategories() != null && !request.getCategories().isEmpty())
             sb.append("- Categories: ").append(String.join(", ", request.getCategories())).append("\n");
-        }
-        if (request.getTargetAudienceDescription() != null) {
+        if (request.getTargetAudienceDescription() != null)
             sb.append("- Target Audience: ").append(request.getTargetAudienceDescription()).append("\n");
-        }
-        if (request.getCampaignObjective() != null) {
+        if (request.getCampaignObjective() != null)
             sb.append("- Objective: ").append(request.getCampaignObjective()).append("\n");
-        }
-        if (request.getBudgetUsd() != null) {
-            sb.append("- Budget: $").append(String.format("%.0f", request.getBudgetUsd())).append(" USD\n");
-        }
-        if (request.getAgeRange() != null) {
-            sb.append("- Age Range: ")
-                .append(request.getAgeRange().getMin()).append("-")
-                .append(request.getAgeRange().getMax()).append("\n");
-        }
-        if (request.getRegion() != null) {
+        if (request.getBudgetUsd() != null)
+            sb.append(String.format("- Budget: $%.0f USD%n", request.getBudgetUsd()));
+        if (request.getAgeRange() != null)
+            sb.append("- Age Range: ").append(request.getAgeRange().getMin())
+              .append("-").append(request.getAgeRange().getMax()).append("\n");
+        if (request.getRegion() != null)
             sb.append("- Region: ").append(request.getRegion()).append("\n");
-        }
-        if (request.getFormatPreference() != null) {
+        if (request.getFormatPreference() != null)
             sb.append("- Format Preference: ").append(request.getFormatPreference()).append("\n");
-        }
-        if (request.getEventDate() != null) {
+        if (eventCtx != null)
             sb.append("- Event Date: ").append(request.getEventDate())
-              .append(" (check lead_time_hours for each outlet to ensure booking is still possible)\n");
-        }
-        if (request.getRelaxationNote() != null) {
+              .append(" (").append(eventCtx.daysUntil()).append(" days from today)\n");
+        if (request.getRelaxationNote() != null)
             sb.append("- Note: ").append(request.getRelaxationNote()).append("\n");
-        }
 
         sb.append("\n## Candidate Outlets\n");
         for (MediaItem item : candidates) {
             sb.append("\n### ").append(item.getTitle());
             sb.append("\n- ID: ").append(item.getId());
 
-            if (item.getUrl() != null) {
+            if (item.getUrl() != null)
                 sb.append("\n- URL: ").append(item.getUrl());
-            }
 
-            // Placement specs
-            if (item.getCostUsd() != null) {
+            if (item.getCostUsd() != null)
                 sb.append("\n- Cost: $").append(item.getCostUsd()).append(" USD");
-            }
-            if (item.getFormatType() != null) {
+            if (item.getFormatType() != null)
                 sb.append("\n- Format: ").append(item.getFormatType());
-            }
-            if (item.getLanguage() != null) {
+            if (item.getLanguage() != null)
                 sb.append("\n- Language: ").append(item.getLanguage());
-            }
             if (item.getLeadTimeHours() != null) {
                 sb.append("\n- Lead Time: ").append(item.getLeadTimeHours()).append("h");
+                // Pre-computed feasibility — LLM reads YES/NO, no arithmetic needed
+                if (eventCtx != null) {
+                    double leadDays = item.getLeadTimeHours() / 24.0;
+                    boolean feasible = leadDays <= eventCtx.daysUntil();
+                    sb.append(String.format(" | Booking feasible: %s (%.1f days lead, %d days to event)",
+                        feasible ? "YES" : "NO", leadDays, eventCtx.daysUntil()));
+                }
             }
-            if (item.getHyperlinksType() != null) {
+            if (item.getHyperlinksType() != null)
                 sb.append("\n- Hyperlinks: ").append(item.getHyperlinksType());
-            }
 
-            // Traffic & SEO
-            if (item.getSimilarwebVisits() != null) {
+            if (item.getSimilarwebVisits() != null)
                 sb.append("\n- Traffic: ").append(formatVisits(item.getSimilarwebVisits()))
                   .append(" monthly visits (SimilarWeb)");
-            }
             if (item.getAhrefsDr() != null || item.getMozDa() != null || item.getSemrushScore() != null) {
                 sb.append("\n- SEO:");
                 if (item.getAhrefsDr() != null)    sb.append(" DR=").append(item.getAhrefsDr());
@@ -239,40 +258,37 @@ public class EnrichmentMechanismService {
                 if (item.getSemrushScore() != null) sb.append(" Semrush=").append(item.getSemrushScore());
             }
 
-            // Restrictions
+            // Restrictions rendered as typed lists — LLM reads declarative facts, not negation logic
             if (item.getRestrictions() != null && !item.getRestrictions().isEmpty()) {
                 List<String> allowed    = new ArrayList<>();
-                List<String> restricted = new ArrayList<>();
+                List<String> forbidden  = new ArrayList<>();
                 item.getRestrictions().forEach((k, v) -> {
                     if (Boolean.TRUE.equals(v))  allowed.add(k);
-                    if (Boolean.FALSE.equals(v)) restricted.add(k);
+                    if (Boolean.FALSE.equals(v)) forbidden.add(k);
                 });
-                if (!allowed.isEmpty())    sb.append("\n- Allowed: ").append(String.join(", ", allowed));
-                if (!restricted.isEmpty()) sb.append("\n- Restricted: ").append(String.join(", ", restricted));
+                if (!allowed.isEmpty())   sb.append("\n- Explicitly allowed: ").append(String.join(", ", allowed));
+                if (!forbidden.isEmpty()) sb.append("\n- FORBIDDEN (exclude if campaign uses): ").append(String.join(", ", forbidden));
             }
 
-            // LLM-enriched fields (may be null before enricher runs)
-            if (item.getCategory() != null) {
+            if (item.getCategory() != null)
                 sb.append("\n- Category: ").append(item.getCategory());
-            }
-            if (item.getDescription() != null) {
+            if (item.getDescription() != null)
                 sb.append("\n- Description: ").append(item.getDescription());
-            }
-            if (item.getTags() != null && item.getTags().length > 0) {
+            if (item.getTags() != null && item.getTags().length > 0)
                 sb.append("\n- Tags: ").append(Arrays.toString(item.getTags()));
-            }
-            if (item.getAudience() != null && !item.getAudience().isEmpty()) {
+            if (item.getAudience() != null && !item.getAudience().isEmpty())
                 sb.append("\n- Audience: ").append(item.getAudience());
-            }
-            if (item.getMetrics() != null && !item.getMetrics().isEmpty()) {
+            if (item.getMetrics() != null && !item.getMetrics().isEmpty())
                 sb.append("\n- Coverage: ").append(item.getMetrics());
-            }
+
             sb.append("\n");
         }
 
         sb.append("\nEvaluate each outlet against the campaign brief and return enriched recommendations.");
         return sb.toString();
     }
+
+    // ── Response building ───────────────────────────────────────────────────────
 
     private RecommendationResponseDTO buildResponse(
             JsonNode json, List<MediaItem> rawCandidates, String sessionId) {
@@ -302,7 +318,6 @@ public class EnrichmentMechanismService {
                 .audience(item.getAudience())
                 .metrics(item.getMetrics())
                 .restrictions(item.getRestrictions())
-                // Structured placement data
                 .costUsd(item.getCostUsd())
                 .similarwebVisits(item.getSimilarwebVisits())
                 .ahrefsDr(item.getAhrefsDr())
@@ -311,7 +326,6 @@ public class EnrichmentMechanismService {
                 .language(item.getLanguage())
                 .leadTimeHours(item.getLeadTimeHours())
                 .hyperlinksType(item.getHyperlinksType())
-                // LLM reasoning
                 .matchScore(recNode.path("match_score").asInt(0))
                 .matchReason(recNode.path("match_reason").asText(null))
                 .suggestedFormat(recNode.path("suggested_format").asText(null))
@@ -360,6 +374,22 @@ public class EnrichmentMechanismService {
             .sessionId(sessionId)
             .recommendations(items)
             .build();
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────────────
+
+    private record EventDateContext(LocalDate date, long daysUntil) {}
+
+    private static EventDateContext parseEventDate(String eventDateStr) {
+        if (eventDateStr == null || eventDateStr.isBlank()) return null;
+        try {
+            LocalDate eventDate = LocalDate.parse(eventDateStr);
+            long days = ChronoUnit.DAYS.between(LocalDate.now(), eventDate);
+            return new EventDateContext(eventDate, Math.max(0, days));
+        } catch (Exception e) {
+            log.warn("[Enrichment] could not parse event_date='{}': {}", eventDateStr, e.getMessage());
+            return null;
+        }
     }
 
     private static String formatVisits(long visits) {
