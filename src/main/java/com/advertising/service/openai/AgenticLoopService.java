@@ -117,9 +117,17 @@ public class AgenticLoopService {
         BUDGET CURRENCY: Accept any format: "500 eur", "€500", "10000 грн", "$2000", "2k usd".
         Convert to USD (1 EUR ≈ 1.1 USD, 1 UAH ≈ 0.024 USD). Indifference expressions → null.
 
-        MAX CLARIFY: You have been given CURRENT_CLARIFY_COUNT (the number of assistant
-        clarifying turns already sent). If CURRENT_CLARIFY_COUNT >= 3 → set action="search"
-        immediately using best available information. Never send a 4th clarifying question.
+        MAX CLARIFY: You have been given CURRENT_CLARIFY_COUNT and RESULTS_SHOWN.
+        - If RESULTS_SHOWN=false AND CURRENT_CLARIFY_COUNT >= 3 → set action="search" immediately.
+        - If RESULTS_SHOWN=true → you MAY ask ONE targeted refinement question (action="clarify")
+          when the user's message is vague ("find more", "show other options", "different media",
+          "something better"). This is a POST-RESULTS collaboration, not a pre-search clarification.
+          If the user sends a clear update (budget/format/category/region) → action="search".
+
+        ACTIVE PARAMS: When RESULTS_SHOWN=true, an "ACTIVE SEARCH PARAMETERS" block is injected
+        above the conversation. These ALWAYS take priority over earlier mentions in history.
+        When user says "find more", "show more results", "more media" → keep ALL active params,
+        just increase max_results by 5 (or to 15 if currently ≤10).
 
         LARGE BRIEF: If the user's first message contains a product/service PLUS at least
         two of (audience, location, objective, budget, format) — set action="search" at once.
@@ -129,12 +137,17 @@ public class AgenticLoopService {
         - ANY TWO of: audience, location, objective, budget, format
         Default objective: "awareness". Missing optional fields → null.
 
-        CLARIFY PRIORITY — when you must ask exactly ONE question:
-        1. Budget AND format both unknown → combine: "What's your budget and preferred format
-           — Article, Press Release, Paid news, or Video?"
-        2. Only budget unknown → ask budget.
-        3. Only format unknown → ask format.
-        4. Otherwise ask about the single most impactful missing field.
+        CLARIFY PRIORITY — when you must ask ONE question (pre-search OR post-results refinement):
+        Pre-search:
+          1. Budget AND format both unknown → ask both together.
+          2. Only budget unknown → ask budget.
+          3. Only format unknown → ask format.
+          4. Otherwise ask the single most impactful missing field.
+        Post-results (when RESULTS_SHOWN=true, user is vague):
+          Ask ONE specific question that would most improve the results, e.g.:
+          "Are you targeting hiring (job candidates) or sales (B2B clients)?",
+          "What specific services do you offer — web dev, mobile apps, AI?",
+          "Any preferred regions or Ukrainian-only media?"
 
         ═══ REASONING STEPS ═══
 
@@ -246,10 +259,13 @@ public class AgenticLoopService {
 
         StringBuilder systemContent = new StringBuilder(ROUTER_SYSTEM_PROMPT);
 
+        boolean resultsShown = previousContext != null && !previousContext.isBlank();
+
         // Inject count as explicit variable — model reads it, never counts itself
         systemContent.append("\n\nCURRENT_CLARIFY_COUNT: ").append(clarifyCount);
-        if (clarifyCount >= 3) {
-            systemContent.append(" ← LIMIT REACHED. You MUST set action=\"search\" now.");
+        systemContent.append("\nRESULTS_SHOWN: ").append(resultsShown);
+        if (clarifyCount >= 3 && !resultsShown) {
+            systemContent.append(" ← PRE-SEARCH LIMIT REACHED. Set action=\"search\" now.");
         }
 
         if ((deviceLocation != null && !deviceLocation.isBlank())
@@ -261,8 +277,11 @@ public class AgenticLoopService {
                 systemContent.append("\n- Language: ").append(deviceLanguage);
         }
 
-        if (previousContext != null && !previousContext.isBlank()) {
-            systemContent.append("\n\nPrevious search context (avoid repeating results):\n")
+        if (resultsShown) {
+            // Frame as authoritative active params — LLM must use these as base,
+            // not fall back to earlier mentions in conversation history.
+            systemContent.append("\n\n⚠️ ACTIVE SEARCH PARAMETERS — these OVERRIDE anything in conversation history.\n")
+                         .append("Use them as defaults for the next search. Only change what the user explicitly requests:\n")
                          .append(previousContext);
         }
 

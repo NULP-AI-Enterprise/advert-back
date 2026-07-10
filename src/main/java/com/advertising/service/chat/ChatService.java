@@ -121,7 +121,7 @@ public class ChatService {
 
                 String ctaMessage = buildCtaMessage(recs.getRecommendations(), s.request());
                 recs.setCtaMessage(ctaMessage);
-                recs.setSuggestions(s.suggestions());
+                recs.setSuggestions(buildSmartSuggestions(recs.getRecommendations(), s.request(), s.suggestions()));
 
                 // Add relaxation note if geo was broadened
                 if (s.request().getRelaxationNote() != null) {
@@ -230,6 +230,66 @@ public class ChatService {
         return cta.toString();
     }
 
+    /**
+     * Generates 3 suggestions based on the actual enriched results rather than
+     * the router's pre-search guesses. Picks what would genuinely improve the results.
+     */
+    private List<String> buildSmartSuggestions(
+            List<RecommendationResponseDTO.MediaItemDTO> recs,
+            RecommendationRequestDTO request,
+            List<String> routerFallback) {
+
+        List<String> suggestions = new ArrayList<>();
+        double budget = request.getBudgetUsd() != null ? request.getBudgetUsd() : Double.MAX_VALUE;
+
+        if (!recs.isEmpty()) {
+            // 1. Budget hint — if most results are over budget, suggest the min cost
+            long overBudget = recs.stream()
+                .filter(r -> r.getCostUsd() != null && r.getCostUsd().doubleValue() > budget)
+                .count();
+            if (overBudget > 0 && request.getBudgetUsd() != null) {
+                recs.stream()
+                    .filter(r -> r.getCostUsd() != null)
+                    .mapToDouble(r -> r.getCostUsd().doubleValue())
+                    .min()
+                    .ifPresent(min -> {
+                        int suggested = (int)(Math.ceil(min / 50) * 50);
+                        if (suggested > budget)
+                            suggestions.add("Set budget to $" + suggested + " to include more options");
+                    });
+            }
+
+            // 2. Format diversity — show the most common format in results
+            recs.stream()
+                .map(RecommendationResponseDTO.MediaItemDTO::getSuggestedFormat)
+                .filter(f -> f != null && !f.isBlank())
+                .collect(java.util.stream.Collectors.groupingBy(f -> f, java.util.stream.Collectors.counting()))
+                .entrySet().stream()
+                .max(java.util.Map.Entry.comparingByValue())
+                .map(java.util.Map.Entry::getKey)
+                .ifPresent(topFormat -> {
+                    if (request.getFormatPreference() == null)
+                        suggestions.add("Filter by " + topFormat + " format only");
+                });
+
+            // 3. Show more if we got few results
+            if (recs.size() < 5)
+                suggestions.add("Increase to 15 results");
+        }
+
+        // 4. Always offer marketing plan
+        if (!suggestions.contains("Create marketing plan"))
+            suggestions.add("Create marketing plan");
+
+        // 5. Fill remaining from router fallback
+        for (String s : routerFallback) {
+            if (suggestions.size() >= 3) break;
+            if (!suggestions.contains(s)) suggestions.add(s);
+        }
+
+        return suggestions.subList(0, Math.min(3, suggestions.size()));
+    }
+
     private static String formatVisits(long visits) {
         if (visits >= 1_000_000) return String.format("%.1fM", visits / 1_000_000.0);
         if (visits >= 1_000)     return String.format("%.0fK", visits / 1_000.0);
@@ -244,17 +304,27 @@ public class ChatService {
                 .map(RecommendationResponseDTO.MediaItemDTO::getTitle)
                 .collect(Collectors.joining(", "));
 
-            String context = String.format(
-                "Filters: categories=%s, region=%s, budget=$%.0f, objective=%s\nTop results shown: %s",
-                request.getCategories(),
-                request.getRegion() != null ? request.getRegion() : "not specified",
-                request.getBudgetUsd() != null ? request.getBudgetUsd() : 0,
-                request.getCampaignObjective() != null ? request.getCampaignObjective() : "not specified",
-                topTitles
-            );
+            // Structured param block — framed as authoritative active state,
+            // not conversation history. Router reads this as ground truth for next query.
+            StringBuilder context = new StringBuilder();
+            context.append("categories=").append(request.getCategories()).append("\n");
+            context.append("budget=").append(request.getBudgetUsd() != null
+                ? "$" + String.format("%.0f", request.getBudgetUsd()) + " USD" : "not specified").append("\n");
+            context.append("objective=").append(request.getCampaignObjective() != null
+                ? request.getCampaignObjective() : "awareness").append("\n");
+            context.append("format=").append(request.getFormatPreference() != null
+                ? request.getFormatPreference() : "not specified").append("\n");
+            if (request.getKeywords() != null && !request.getKeywords().isEmpty())
+                context.append("keywords=").append(request.getKeywords()).append("\n");
+            context.append("region=").append(request.getRegion() != null
+                ? request.getRegion() : "not specified").append("\n");
+            context.append("country=").append(request.getCountry() != null
+                ? request.getCountry() : "not specified").append("\n");
+            context.append("max_results=").append(request.getMaxResults()).append("\n");
+            context.append("Last results shown: ").append(topTitles);
 
             // Also store full recs for marketing plan generation
-            String fullContext = context + "\n\nFull placements:\n" +
+            String fullContext = context.toString() + "\n\nFull placements:\n" +
                 recs.getRecommendations().stream()
                     .map(r -> String.format("- %s (%s, score=%d, format=%s, cost=$%s%s)",
                         r.getTitle(), r.getCategory(),
