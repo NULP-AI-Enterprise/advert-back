@@ -62,7 +62,7 @@ class RecommendationControllerTest {
 
         sampleResponse = RecommendationResponseDTO.builder()
                 .recommendations(List.of(item))
-                .explanation("Best match based on your FMCG brief")
+                .reasoning("Best match based on your FMCG brief")
                 .build();
 
         sampleMedia = MediaItem.builder()
@@ -102,7 +102,7 @@ class RecommendationControllerTest {
                     .andExpect(jsonPath("$.recommendations", hasSize(1)))
                     .andExpect(jsonPath("$.recommendations[0].title", is("Prime-time TV Spot")))
                     .andExpect(jsonPath("$.recommendations[0].matchScore", is(85)))
-                    .andExpect(jsonPath("$.explanation", notNullValue()));
+                    .andExpect(jsonPath("$.reasoning", notNullValue()));
         }
 
         @Test
