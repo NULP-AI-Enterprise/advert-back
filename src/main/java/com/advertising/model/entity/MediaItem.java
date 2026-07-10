@@ -47,13 +47,13 @@ public class MediaItem {
     @Column(name = "format_type", length = 50)
     private String formatType;
 
-    @Column(length = 100)
+    @Column(length = 500)
     private String language;
 
     @Column(name = "lead_time_hours")
     private Integer leadTimeHours;
 
-    @Column(name = "hyperlinks_type", length = 50)
+    @Column(name = "hyperlinks_type", length = 500)
     private String hyperlinksType;
 
     // ── Traffic & SEO metrics (from PRNEW CSV) ────────────────────────────────

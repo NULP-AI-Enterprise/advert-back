@@ -20,13 +20,15 @@ public class RecommendationRequestDTO {
 
     // SQL filter params extracted from campaign brief
     private List<String> categories;
+    private List<String> keywords;              // free-form topic terms (crypto, blockchain, etc.)
     private String targetAudienceDescription;
     private AgeRange ageRange;
     private Double budgetUsd;
-    private String campaignObjective;   // awareness | leads | conversions | engagement
-    private String region;
-    private String minReachTier;        // national | regional | local | niche
-    private String relaxationNote;      // set by RecEngineService when geo is broadened
+    private String campaignObjective;           // awareness | leads | conversions | engagement
+    private String region;                      // city / district level
+    private String country;                     // country level (fallback for region)
+    private String minReachTier;                // national | regional | local | niche
+    private String relaxationNote;              // set by RecEngineService when geo is broadened
 
     private int maxResults;
 

@@ -92,18 +92,42 @@ public class AgenticLoopService {
           "Identify key metrics for success"
           "Adjust campaign timing"
 
+        ═══ CATEGORY CLASSIFICATION ═══
+
+        When classifying the product/service into categories, use ONLY these canonical values:
+        News | Business | Technology | Sports | Fashion | Agriculture | Video | Entertainment | Science | Politics
+
+        Map broadly: fintech/crypto/blockchain/web3/SaaS/AI → Technology
+                     finance/investment/insurance/real estate/B2B → Business
+                     health/medicine/biotech → Science
+                     politics/government/NGO → Politics
+        If the topic spans multiple categories, return up to 3 best matches.
+
+        ALSO extract `keywords`: 3-6 specific topic terms from the product/service description
+        that are NOT covered by the canonical categories (e.g. "crypto", "blockchain", "wallet",
+        "IPO", "organic food", "electric vehicles"). These drive full-text search.
+
+        ═══ GEO EXTRACTION ═══
+
+        Extract TWO geo fields:
+        - `region`: the most specific location mentioned (city, district, state) — e.g. "Kyiv", "Berlin", "California"
+        - `country`: the country — e.g. "Ukraine", "Germany", "USA"
+        Both are optional. If only a country is mentioned, leave `region` null.
+
         Respond ONLY in valid JSON — no markdown, no prose outside JSON:
         {
           "reasoning": "<2-3 sentences: what you found in history, clarify count, why this action>",
           "action": "clarify" | "search" | "plan",
           "question": "<string, only when action=clarify>",
           "search_params": {
-            "categories": ["<string>"],
+            "categories": ["<canonical category>"],
+            "keywords": ["<topic term>"],
             "target_audience_description": "<string>",
             "age_range": { "min": 0, "max": 0 },
             "budget_usd": 0,
             "campaign_objective": "awareness|leads|conversions|engagement",
-            "region": "<string>",
+            "region": "<city or district, or null>",
+            "country": "<country name, or null>",
             "max_results": 10
           },
           "suggestions": ["<concrete refinement command>", "<concrete refinement command>", "<concrete refinement command>"]
@@ -198,6 +222,12 @@ public class AgenticLoopService {
                 builder.categories(cats);
             }
 
+            if (params.has("keywords")) {
+                List<String> kws = new ArrayList<>();
+                params.path("keywords").forEach(n -> kws.add(n.asText()));
+                if (!kws.isEmpty()) builder.keywords(kws);
+            }
+
             String audienceDesc = params.path("target_audience_description").asText(null);
             if (audienceDesc != null && !audienceDesc.isBlank())
                 builder.targetAudienceDescription(audienceDesc);
@@ -218,6 +248,9 @@ public class AgenticLoopService {
 
             String region = params.path("region").asText(null);
             if (region != null && !region.isBlank()) builder.region(region);
+
+            String country = params.path("country").asText(null);
+            if (country != null && !country.isBlank()) builder.country(country);
 
             int maxResults = params.path("max_results").asInt(defaultMaxResults);
             builder.maxResults(maxResults > 0 ? maxResults : defaultMaxResults);

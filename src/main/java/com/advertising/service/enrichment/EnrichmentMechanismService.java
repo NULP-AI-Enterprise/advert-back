@@ -49,8 +49,20 @@ public class EnrichmentMechanismService {
         - If cost_usd > budget: EXCLUDE unless the outlet is exceptionally strong
         - For multi-placement campaigns: consider how many placements fit in budget
 
-        Restriction check: if the campaign product/category matches a restricted field
-        (gambling=false, crypto=false, adult=false, etc.) for that outlet — EXCLUDE.
+        Restriction check — read carefully:
+        - ONLY EXCLUDE if the specific content type is EXPLICITLY set to false
+          (e.g., restrictions contains crypto: false → crypto content is FORBIDDEN).
+        - If the key is ABSENT from restrictions or restrictions is empty → content is PERMITTED.
+          Absence of a key means "not restricted", NOT "not allowed". Do NOT exclude.
+        - If the key is true → content is explicitly ALLOWED, boost score by +5.
+
+        Pre-enrichment handling:
+        - Some outlets may have no description, tags, or audience data (still being processed).
+        - In that case evaluate using ONLY: cost_usd, similarweb_visits, ahrefs_dr,
+          format_type, language, restrictions. This is sufficient data to score.
+        - A missing description does NOT mean poor fit. Default base score: 55.
+          Adjust up/down based on cost fit, traffic volume, and format match.
+        - NEVER score below 40 solely because description is missing.
 
         For each included item provide:
         - match_score: 40-100
