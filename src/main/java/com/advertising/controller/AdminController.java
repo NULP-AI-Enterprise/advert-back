@@ -13,6 +13,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -94,15 +95,23 @@ public class AdminController {
     }
 
     @PostMapping("/enrich-all")
-    public ResponseEntity<Void> enrichAll() {
+    public ResponseEntity<Map<String, Object>> enrichAll(
+            @RequestParam(required = false) Integer limit) {
+
+        String uri = (limit != null && limit > 0)
+                ? enrichmentUrl + "/enrich/start?limit=" + limit
+                : enrichmentUrl + "/enrich/start";
+
         webClientBuilder.build()
                 .post()
-                .uri(enrichmentUrl + "/enrich/start")
+                .uri(uri)
                 .retrieve()
                 .toBodilessEntity()
                 .doOnError(e -> log.warn("Enrichment service unreachable: {}", e.getMessage()))
                 .subscribe();
 
-        return ResponseEntity.accepted().build();
+        Map<String, Object> body = new HashMap<>();
+        body.put("queued", limit != null ? limit : "all");
+        return ResponseEntity.accepted().body(body);
     }
 }
