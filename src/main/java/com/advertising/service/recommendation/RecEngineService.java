@@ -3,6 +3,7 @@ package com.advertising.service.recommendation;
 import com.advertising.model.dto.RecommendationRequestDTO;
 import com.advertising.model.entity.MediaItem;
 import com.advertising.repository.MediaRepository;
+import com.advertising.service.openai.OpenAIService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -10,6 +11,8 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -17,15 +20,43 @@ import java.util.*;
 public class RecEngineService {
 
     private final MediaRepository mediaRepository;
+    private final OpenAIService openAIService;
+
+    private static final double VECTOR_THRESHOLD = 0.60;
 
     public Mono<List<MediaItem>> findCandidates(RecommendationRequestDTO request) {
-        return Mono.fromCallable(() -> sqlQuery(request))
-            .subscribeOn(Schedulers.boundedElastic())
+        String queryText = buildQueryText(request);
+        return openAIService.createEmbedding(queryText)
+            .map(RecEngineService::vectorToJson)
+            .onErrorResume(e -> {
+                log.warn("[RecEngine] embedding failed, proceeding without vector search: {}", e.getMessage());
+                return Mono.just("");
+            })
+            .flatMap(embeddingJson -> Mono.fromCallable(() -> sqlQuery(request, embeddingJson))
+                .subscribeOn(Schedulers.boundedElastic()))
             .doOnNext(items -> log.info("[RecEngine] {} candidates for session={}", items.size(), request.getSessionId()))
             .doOnError(e -> log.error("[RecEngine] query failed: {}", e.getMessage(), e));
     }
 
-    private List<MediaItem> sqlQuery(RecommendationRequestDTO request) {
+    private String buildQueryText(RecommendationRequestDTO request) {
+        List<String> parts = new ArrayList<>();
+        if (request.getCategories() != null) parts.addAll(request.getCategories());
+        if (request.getKeywords() != null) parts.addAll(request.getKeywords());
+        if (request.getTargetAudienceDescription() != null) parts.add(request.getTargetAudienceDescription());
+        return String.join(" ", parts);
+    }
+
+    private static String vectorToJson(float[] vector) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < vector.length; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(vector[i]);
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private List<MediaItem> sqlQuery(RecommendationRequestDTO request, String embeddingJson) {
         int targetLimit = request.getMaxResults() > 0 ? request.getMaxResults() : 10;
         int fetchLimit  = Math.min(targetLimit * 3, 30);
 
@@ -33,16 +64,26 @@ public class RecEngineService {
         log.info("[RecEngine] keywords={} region='{}' country='{}' fetchLimit={}",
             keywords, request.getRegion(), request.getCountry(), fetchLimit);
 
+        // Dedup key: url + "|" + formatType prevents same outlet×format appearing twice
+        // (defense against duplicate CSV rows). Falls back to UUID string when url is null.
+        LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
+        Set<String> seenKeys = new HashSet<>();
+
         // ── Level 1: keyword × city/region ────────────────────────────────────
-        LinkedHashMap<UUID, MediaItem> pool = searchByKeywords(keywords, request.getRegion(), fetchLimit);
+        searchByKeywords(keywords, request.getRegion(), fetchLimit, pool, seenKeys);
+
+        // ── Level 1.5: vector similarity search (enriched items only) ─────────
+        if (!embeddingJson.isBlank()) {
+            resolveItems(mediaRepository.findSimilarByEmbedding(embeddingJson, VECTOR_THRESHOLD, fetchLimit))
+                .forEach(item -> addToPool(item, pool, seenKeys));
+            if (!pool.isEmpty()) log.info("[RecEngine] after vector search → pool={}", pool.size());
+        }
 
         // ── Level 2: keyword × country (if region gave too few) ───────────────
         if (pool.size() < targetLimit && request.getCountry() != null && !request.getCountry().isBlank()) {
             String country = request.getCountry();
-            searchByKeywords(keywords, country, fetchLimit)
-                .forEach((id, item) -> pool.putIfAbsent(id, item));
-
-            if (pool.size() > 0 && request.getRegion() != null && !request.getRegion().isBlank()) {
+            searchByKeywords(keywords, country, fetchLimit, pool, seenKeys);
+            if (!pool.isEmpty() && request.getRegion() != null && !request.getRegion().isBlank()) {
                 request.setRelaxationNote(
                     "No results specific to " + request.getRegion() + " — showing " + country + " media");
             }
@@ -50,37 +91,54 @@ public class RecEngineService {
 
         // ── Level 3: keyword × no geo (if still thin) ─────────────────────────
         if (pool.size() < targetLimit) {
-            searchByKeywords(keywords, "", fetchLimit)
-                .forEach((id, item) -> pool.putIfAbsent(id, item));
-
-            if (pool.size() > 0 && (request.getRegion() != null || request.getCountry() != null)) {
+            searchByKeywords(keywords, "", fetchLimit, pool, seenKeys);
+            if (!pool.isEmpty() && (request.getRegion() != null || request.getCountry() != null)) {
                 request.setRelaxationNote("Showing top media by traffic — no region-specific results found");
             }
         }
 
-        // ── Absolute fallback: top by traffic ──────────────────────────────────
-        if (pool.isEmpty()) {
-            log.warn("[RecEngine] no keyword matches — falling back to top-N by traffic");
-            resolveItems(mediaRepository.findTopN(fetchLimit))
-                .forEach(item -> pool.putIfAbsent(item.getId(), item));
+        // ── Level 4a: pad with enriched items matching the requested category ───
+        if (pool.size() < targetLimit && request.getCategories() != null) {
+            for (String cat : request.getCategories()) {
+                resolveItems(mediaRepository.findByCategory(cat, fetchLimit))
+                    .forEach(item -> addToPool(item, pool, seenKeys));
+                if (pool.size() >= targetLimit) break;
+            }
+            log.info("[RecEngine] after category padding → pool={}", pool.size());
+        }
+
+        // ── Level 4b: fill remaining slots with top-traffic items ─────────────
+        if (pool.size() < targetLimit) {
+            log.info("[RecEngine] pool={} / target={} — padding with top-traffic items",
+                pool.size(), targetLimit);
+            resolveItems(mediaRepository.findTopN(fetchLimit * 2))
+                .forEach(item -> addToPool(item, pool, seenKeys));
         }
 
         log.info("[RecEngine] {} total candidates (target={})", pool.size(), targetLimit);
         return new ArrayList<>(pool.values());
     }
 
-    private LinkedHashMap<UUID, MediaItem> searchByKeywords(
-            List<String> keywords, String geo, int limit) {
+    private void searchByKeywords(
+            List<String> keywords, String geo, int limit,
+            LinkedHashMap<UUID, MediaItem> pool, Set<String> seenKeys) {
 
-        LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
         String region = geo != null ? geo : "";
-
         for (String kw : keywords) {
+            if (kw.length() < 4) continue;
             List<Object[]> rows = mediaRepository.findByTextAndRegion(kw, region, limit);
-            resolveItems(rows).forEach(item -> pool.putIfAbsent(item.getId(), item));
+            resolveItems(rows).forEach(item -> addToPool(item, pool, seenKeys));
             if (pool.size() >= limit) break;
         }
-        return pool;
+    }
+
+    private static void addToPool(MediaItem item, LinkedHashMap<UUID, MediaItem> pool, Set<String> seenKeys) {
+        String key = item.getUrl() != null
+            ? item.getUrl() + "|" + Objects.toString(item.getFormatType(), "")
+            : item.getId().toString();
+        if (seenKeys.add(key)) {
+            pool.put(item.getId(), item);
+        }
     }
 
     /**
@@ -126,15 +184,21 @@ public class RecEngineService {
         "the", "and", "for", "with", "that", "this", "from", "are", "who",
         "ages", "age", "primarily", "their", "have", "been", "they", "will",
         "target", "audience", "demographic", "people", "users", "customers",
-        "men", "women", "aged", "tech", "savvy", "based", "interested"
+        "men", "women", "aged", "savvy", "based", "interested", "about",
+        "looking", "focused", "those", "want", "need", "more", "also"
     );
 
     private List<MediaItem> resolveItems(List<Object[]> rows) {
-        return rows.stream()
-            .map(row -> {
-                UUID id = UUID.fromString((String) row[0]);
-                return mediaRepository.findById(id).orElse(null);
-            })
+        if (rows.isEmpty()) return List.of();
+        // Collect all IDs first, then load in a single IN query (avoids N+1)
+        List<UUID> ids = rows.stream()
+            .map(row -> UUID.fromString((String) row[0]))
+            .toList();
+        Map<UUID, MediaItem> byId = mediaRepository.findAllById(ids).stream()
+            .collect(Collectors.toMap(MediaItem::getId, Function.identity()));
+        // Preserve the original order (sorted by traffic from SQL)
+        return ids.stream()
+            .map(byId::get)
             .filter(Objects::nonNull)
             .toList();
     }

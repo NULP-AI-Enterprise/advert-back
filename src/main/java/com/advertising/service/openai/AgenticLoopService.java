@@ -103,9 +103,22 @@ public class AgenticLoopService {
                      politics/government/NGO → Politics
         If the topic spans multiple categories, return up to 3 best matches.
 
-        ALSO extract `keywords`: 3-6 specific topic terms from the product/service description
-        that are NOT covered by the canonical categories (e.g. "crypto", "blockchain", "wallet",
-        "IPO", "organic food", "electric vehicles"). These drive full-text search.
+        ALSO extract `keywords`: 5-8 specific topic terms that drive full-text search against
+        a database of media outlet titles, URLs, descriptions, and tags.
+
+        KEYWORD RULES — follow all of them:
+        1. Every keyword MUST be at least 4 characters long. Never include 2-3 letter terms
+           like "AI", "IT", "ML", "AR", "VR", "B2B" — they produce too many false positives.
+        2. Spell out abbreviations: "AI" → "artificial intelligence" AND "machine learning";
+           "IT" → "technology" AND "digital" AND "software"; "ML" → "machine learning".
+        3. Include DOMAIN-FRIENDLY terms: words likely to appear in a media site's name or URL.
+           For Technology: always include "tech", "digital", "software", "startup".
+           For Business: always include "business", "finance", "economic".
+           For Science: always include "science", "research".
+        4. Include both the specific topic AND broader synonyms:
+           e.g. "drones" → also "drone", "aviation", "aerospace", "UAV technologies"
+                "crypto" → also "blockchain", "digital assets"
+        5. Return 5-8 keywords total. Prefer longer, more specific terms over short generic ones.
 
         ═══ GEO EXTRACTION ═══
 
@@ -225,6 +238,9 @@ public class AgenticLoopService {
             if (params.has("keywords")) {
                 List<String> kws = new ArrayList<>();
                 params.path("keywords").forEach(n -> kws.add(n.asText()));
+                // Hard filter: remove short terms that produce LIKE false-positives.
+                // "AI" → LIKE '%ai%' matches "mail", "detail", "social media" etc.
+                kws.removeIf(k -> k == null || k.trim().length() < 4);
                 if (!kws.isEmpty()) builder.keywords(kws);
             }
 

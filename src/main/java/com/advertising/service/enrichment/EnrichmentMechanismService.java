@@ -42,7 +42,10 @@ public class EnrichmentMechanismService {
         - 80-100: Excellent fit — cost, audience, category, and restrictions all align
         - 60-79:  Good fit — most factors align, minor gaps
         - 40-59:  Partial fit — useful but not ideal
-        - < 40:   Poor fit — EXCLUDE entirely (do not include in response)
+        - < 30:   Poor fit — EXCLUDE entirely (do not include in response)
+
+        Note: the exclusion threshold is 30, NOT 40. Include marginal candidates — the user
+        can always filter further. A missed good result is worse than an extra mediocre one.
 
         Budget guidance (use exact cost_usd, not vague tiers):
         - If cost_usd > budget * 0.5: flag as expensive, reduce score by 20
@@ -58,11 +61,18 @@ public class EnrichmentMechanismService {
 
         Pre-enrichment handling:
         - Some outlets may have no description, tags, or audience data (still being processed).
-        - In that case evaluate using ONLY: cost_usd, similarweb_visits, ahrefs_dr,
-          format_type, language, restrictions. This is sufficient data to score.
-        - A missing description does NOT mean poor fit. Default base score: 55.
-          Adjust up/down based on cost fit, traffic volume, and format match.
-        - NEVER score below 40 solely because description is missing.
+        - In that case, infer the editorial focus from the outlet's NAME and URL:
+            "ain.ua" → Ukrainian tech/startup news (score as Technology)
+            "itc.ua" → Ukrainian IT media
+            "dou.ua" → Ukrainian developers community
+            "tsn.ua" → national Ukrainian TV news (broad reach)
+            "unian.ua" → national Ukrainian news agency
+          Apply this logic broadly: a .ua domain with "tech", "it", "digit", "soft",
+          "start", "code", "dev", "data" in its name → treat as Technology outlet.
+        - For high-traffic national outlets (similarweb_visits > 1M) without description:
+          base score 60 — they reach mass audiences relevant to any awareness campaign.
+        - For unknown/medium outlets without description: base score 50.
+        - NEVER score below 30 solely because description is missing.
 
         For each included item provide:
         - match_score: 40-100
