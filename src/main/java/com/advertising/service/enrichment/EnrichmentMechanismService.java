@@ -95,10 +95,14 @@ public class EnrichmentMechanismService {
 
         ═══ BUDGET ═══
 
-        Use exact cost_usd — never vague tiers:
-        - cost_usd > budget × 0.5 → flag as expensive, reduce score by 20
-        - cost_usd > budget → EXCLUDE unless score would otherwise be 85+
-        - No budget specified → never penalize for cost; mention cost in reasoning
+        Use exact cost_usd — never vague tiers.
+        NEVER exclude an outlet solely because cost exceeds budget.
+        Always include and flag — let the user decide. Apply score penalties:
+        - cost_usd ≤ budget              → no penalty; note in budget_fit
+        - cost_usd > budget × 0.5        → reduce score by 10, note in budget_fit
+        - cost_usd > budget              → reduce score by 20, note "Over budget by $X" in budget_fit
+        - cost_usd > budget × 2          → reduce score by 35, note "Significantly over budget"
+        - No budget specified            → no penalty; mention cost in reasoning
 
         ═══ FORMAT MATCHING ═══
 
