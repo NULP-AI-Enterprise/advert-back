@@ -45,18 +45,47 @@ data:
 
     CREATE TABLE IF NOT EXISTS media_items (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        title VARCHAR(500) NOT NULL,
+
+        title           VARCHAR(500) NOT NULL,
+        url             VARCHAR(500),
+        marketplace_url VARCHAR(500),
+        country         VARCHAR(100) DEFAULT 'Ukraine',
+
+        cost_usd               NUMERIC(10,2),
+        format_type            VARCHAR(50),
+        language               VARCHAR(100),
+        lead_time_hours        INTEGER,
+        hyperlinks_type        VARCHAR(50),
+
+        similarweb_visits       BIGINT,
+        ahrefs_dr               SMALLINT,
+        moz_da                  SMALLINT,
+        semrush_score           SMALLINT,
+        organic_traffic_ahrefs  INTEGER,
+        organic_traffic_semrush INTEGER,
+
+        restrictions JSONB DEFAULT '{}',
+
         description TEXT,
-        category VARCHAR(100),
-        tags TEXT[],
-        audience JSONB,
-        metrics JSONB,
+        category    VARCHAR(100),
+        tags        TEXT[],
+        audience    JSONB DEFAULT '{}',
+        metrics     JSONB DEFAULT '{}',
+
+        embedding   vector(1536),
+
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_chat_messages_session   ON chat_messages(session_id);
-    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id  ON chat_sessions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_ref ON chat_sessions(user_ref);
-    CREATE INDEX IF NOT EXISTS idx_media_items_category   ON media_items(category);
-    CREATE INDEX IF NOT EXISTS idx_magic_links_token      ON magic_links(token);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_session    ON chat_messages(session_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id   ON chat_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_ref  ON chat_sessions(user_ref);
+    CREATE INDEX IF NOT EXISTS idx_magic_links_token       ON magic_links(token);
+    CREATE INDEX IF NOT EXISTS idx_media_items_category    ON media_items(category);
+    CREATE INDEX IF NOT EXISTS idx_media_items_country     ON media_items(country);
+    CREATE INDEX IF NOT EXISTS idx_media_items_format_type ON media_items(format_type);
+    CREATE INDEX IF NOT EXISTS idx_media_items_cost_usd    ON media_items(cost_usd);
+    CREATE INDEX IF NOT EXISTS idx_media_items_visits      ON media_items(similarweb_visits DESC NULLS LAST);
+    CREATE INDEX IF NOT EXISTS idx_media_items_ahrefs_dr   ON media_items(ahrefs_dr DESC NULLS LAST);
+    CREATE INDEX IF NOT EXISTS idx_media_items_embedding   ON media_items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);

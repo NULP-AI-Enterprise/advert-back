@@ -125,7 +125,7 @@ public class ChatService {
 
                 // Add relaxation note if geo was broadened
                 if (s.request().getRelaxationNote() != null) {
-                    recs.setExplanation(s.request().getRelaxationNote());
+                    recs.setReasoning(s.request().getRelaxationNote());
                 }
 
                 WebSocketMessage recsMsg = WebSocketMessage.builder()
@@ -241,11 +241,16 @@ public class ChatService {
             // Also store full recs for marketing plan generation
             String fullContext = context + "\n\nFull placements:\n" +
                 recs.getRecommendations().stream()
-                    .map(r -> String.format("- %s (%s, score=%d, format=%s)",
+                    .map(r -> String.format("- %s (%s, score=%d, format=%s, cost=$%s%s)",
                         r.getTitle(), r.getCategory(),
                         r.getMatchScore() != null ? r.getMatchScore() : 0,
-                        r.getSuggestedFormat() != null ? r.getSuggestedFormat() : "TBD"))
+                        r.getSuggestedFormat() != null ? r.getSuggestedFormat() : "TBD",
+                        r.getCostUsd() != null ? r.getCostUsd() : "N/A",
+                        r.getBudgetFit() != null ? ", " + r.getBudgetFit() : ""))
                     .collect(Collectors.joining("\n"));
+            if (recs.getReasoning() != null && !recs.getReasoning().isBlank()) {
+                fullContext += "\n\nStrategy reasoning: " + recs.getReasoning();
+            }
 
             redisTemplate.opsForValue().set(REC_CONTEXT_PREFIX + sessionId, fullContext, REC_CONTEXT_TTL);
         } catch (Exception e) {

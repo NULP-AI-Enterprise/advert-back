@@ -10,21 +10,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.math.BigDecimal;
+import java.util.*;
 
 /**
- * V1 Enrichment Mechanism — takes raw SQL candidates and uses GPT-4o to produce
- * enriched recommendations with match_reason, suggested_format, estimated_reach
- * and match_score for each media item.
- *
- * Flow:
- *  rawCandidates (List<MediaItem>) + campaign context (RecommendationRequestDTO)
- *      → LLM prompt → JSON response
- *      → Mono<RecommendationResponseDTO> sorted by matchScore desc
+ * Takes raw SQL candidates and uses GPT to produce enriched recommendations
+ * with reasoning grounded in REAL data: cost_usd, similarweb_visits, ahrefs_dr,
+ * moz_da, format_type, language, and content restrictions from PRNEW CSV.
  */
 @Slf4j
 @Service
@@ -33,61 +25,73 @@ public class EnrichmentMechanismService {
 
     private final OpenAIService openAIService;
 
-    private static final String ENRICHMENT_SYSTEM_PROMPT = """
-        You are a senior media planning strategist. Your job is to evaluate media placements
-        against a campaign brief and return ONLY the best matches — not every item.
+    private static final String SYSTEM_PROMPT = """
+        You are a senior media planning strategist for the Ukrainian market.
+        Your job is to evaluate PR placement opportunities against a campaign brief
+        and return ONLY the best matches — not every candidate.
+
+        You have access to REAL data for each outlet:
+        - cost_usd: actual placement price from the PR marketplace
+        - similarweb_visits: verified monthly traffic
+        - ahrefs_dr / moz_da: SEO authority scores
+        - format_type: placement format (Article, Press Release, Paid news, etc.)
+        - language: publication language
+        - restrictions: content categories allowed or restricted
 
         Scoring rules:
-        - 80-100: Excellent fit — audience, category, geo, and budget all align closely
+        - 80-100: Excellent fit — cost, audience, category, and restrictions all align
         - 60-79:  Good fit — most factors align, minor gaps
         - 40-59:  Partial fit — useful but not ideal
-        - 0-39:   Poor fit — EXCLUDE from output entirely (do not include in response)
+        - < 40:   Poor fit — EXCLUDE entirely (do not include in response)
 
-        Budget vs pricing_tier guidance:
-        - budget < $500 → only "budget" tier items are realistic; "premium" score penalty -30
-        - $500–$2000 → "budget" and "mid" tier are good; "premium" score penalty -15
-        - $2000–$10000 → all tiers viable; prefer "mid" and "premium" for lead gen
-        - $10000+ → prefer "premium" for brand safety
+        Budget guidance (use exact cost_usd, not vague tiers):
+        - If cost_usd > budget * 0.5: flag as expensive, reduce score by 20
+        - If cost_usd > budget: EXCLUDE unless the outlet is exceptionally strong
+        - For multi-placement campaigns: consider how many placements fit in budget
 
-        For each included item, provide:
-        - match_score: 40-100 (never below 40 — exclude items scoring below 40 instead)
-        - match_reason: 1-2 sentences. Cite SPECIFIC facts from the media item's audience/metrics.
-          Good example: "Reaches Ukrainian business owners 28-45 — aligns with target demo; national
-          reach covers Kyiv + regional centers; mid-tier pricing fits $5K/month budget well."
-        - suggested_format: best ad format for this campaign objective from metrics.ad_formats_available
-          (for leads/conversions → Native or Sponsored Post; for awareness → Banner or Pre-roll)
-        - estimated_reach: concrete estimate using metrics data
-          (e.g. "~500K monthly readers, 65% business audience" — use reach_tier and geography as signals)
+        Restriction check: if the campaign product/category matches a restricted field
+        (gambling=false, crypto=false, adult=false, etc.) for that outlet — EXCLUDE.
+
+        For each included item provide:
+        - match_score: 40-100
+        - match_reason: 2-3 sentences citing SPECIFIC numbers. Example:
+          "1.6M monthly visits (SimilarWeb) with DR=77 — strong SEO authority.
+          Cost $130 fits well within $2000 budget (15% of monthly spend).
+          Ukrainian + Russian language aligns with target audience."
+        - suggested_format: best format for this campaign from available format_type
+          (for leads → Article or Paid news; for awareness → Press Release)
+        - estimated_reach: concrete estimate, e.g. "~1.6M monthly readers, national reach"
+        - budget_fit: how cost fits, e.g. "costs $130 of $2000 budget — fits 15× per month"
+
+        Also return a top-level `reasoning` field (3-5 sentences) explaining:
+        - What the overall budget allows
+        - Why the selected outlets match the target audience
+        - Any notable trade-offs or gaps
 
         Return ONLY valid JSON — no markdown, no prose:
         {
+          "reasoning": "string",
           "recommendations": [
             {
               "media_item_id": "uuid-string",
               "match_score": 40-100,
               "match_reason": "string",
               "suggested_format": "string",
-              "estimated_reach": "string"
+              "estimated_reach": "string",
+              "budget_fit": "string"
             }
           ]
         }
 
-        Sort by match_score descending. Return at most 10 items. Exclude poor matches.
+        Sort recommendations by match_score descending. Return at most 10 items.
         """;
 
-    /**
-     * Enriches raw media item candidates with LLM-generated match context.
-     *
-     * @param rawCandidates list of raw MediaItem results from RecEngineService
-     * @param request       campaign context from the agentic loop
-     * @return Mono with fully enriched RecommendationResponseDTO sorted by matchScore
-     */
     public Mono<RecommendationResponseDTO> enrich(
             List<MediaItem> rawCandidates,
             RecommendationRequestDTO request) {
 
         if (rawCandidates.isEmpty()) {
-            log.warn("[Enrichment] no candidates to enrich for session={}", request.getSessionId());
+            log.warn("[Enrichment] no candidates for session={}", request.getSessionId());
             return Mono.just(RecommendationResponseDTO.builder()
                 .sessionId(request.getSessionId())
                 .recommendations(List.of())
@@ -101,23 +105,18 @@ public class EnrichmentMechanismService {
 
         return openAIService.chatCompletionJson(messages)
             .map(json -> buildResponse(json, rawCandidates, request.getSessionId()))
-            .doOnNext(resp -> log.info("[Enrichment] enriched {} items for session={}",
+            .doOnNext(resp -> log.info("[Enrichment] {} recommendations for session={}",
                 resp.getRecommendations().size(), request.getSessionId()))
-            .doOnError(e -> log.error("[Enrichment] LLM call failed: {}", e.getMessage(), e))
+            .doOnError(e -> log.error("[Enrichment] LLM failed: {}", e.getMessage(), e))
             .onErrorReturn(buildFallbackResponse(rawCandidates, request.getSessionId()));
     }
 
     private List<Map<String, String>> buildMessages(
-            List<MediaItem> candidates,
-            RecommendationRequestDTO request) {
-
-        List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", ENRICHMENT_SYSTEM_PROMPT));
-
-        String userPrompt = buildUserPrompt(candidates, request);
-        messages.add(Map.of("role", "user", "content", userPrompt));
-
-        return messages;
+            List<MediaItem> candidates, RecommendationRequestDTO request) {
+        return List.of(
+            Map.of("role", "system", "content", SYSTEM_PROMPT),
+            Map.of("role", "user",   "content", buildUserPrompt(candidates, request))
+        );
     }
 
     private String buildUserPrompt(List<MediaItem> candidates, RecommendationRequestDTO request) {
@@ -134,7 +133,7 @@ public class EnrichmentMechanismService {
             sb.append("- Objective: ").append(request.getCampaignObjective()).append("\n");
         }
         if (request.getBudgetUsd() != null) {
-            sb.append("- Budget: $").append(request.getBudgetUsd()).append(" USD\n");
+            sb.append("- Budget: $").append(String.format("%.0f", request.getBudgetUsd())).append(" USD\n");
         }
         if (request.getAgeRange() != null) {
             sb.append("- Age Range: ")
@@ -144,39 +143,87 @@ public class EnrichmentMechanismService {
         if (request.getRegion() != null) {
             sb.append("- Region: ").append(request.getRegion()).append("\n");
         }
-
-        sb.append("\n## Media Items\n");
-        for (MediaItem item : candidates) {
-            sb.append("\n### ID: ").append(item.getId()).append("\n");
-            sb.append("- Title: ").append(item.getTitle()).append("\n");
-            if (item.getDescription() != null) {
-                sb.append("- Description: ").append(item.getDescription()).append("\n");
-            }
-            if (item.getCategory() != null) {
-                sb.append("- Category: ").append(item.getCategory()).append("\n");
-            }
-            if (item.getTags() != null && item.getTags().length > 0) {
-                sb.append("- Tags: ").append(Arrays.toString(item.getTags())).append("\n");
-            }
-            if (item.getAudience() != null) {
-                sb.append("- Audience: ").append(item.getAudience()).append("\n");
-            }
-            if (item.getMetrics() != null) {
-                sb.append("- Metrics: ").append(item.getMetrics()).append("\n");
-            }
+        if (request.getRelaxationNote() != null) {
+            sb.append("- Note: ").append(request.getRelaxationNote()).append("\n");
         }
 
-        sb.append("\nPlease evaluate each media item against the campaign brief and return enriched recommendations.");
+        sb.append("\n## Candidate Outlets\n");
+        for (MediaItem item : candidates) {
+            sb.append("\n### ").append(item.getTitle());
+            sb.append("\n- ID: ").append(item.getId());
+
+            if (item.getUrl() != null) {
+                sb.append("\n- URL: ").append(item.getUrl());
+            }
+
+            // Placement specs
+            if (item.getCostUsd() != null) {
+                sb.append("\n- Cost: $").append(item.getCostUsd()).append(" USD");
+            }
+            if (item.getFormatType() != null) {
+                sb.append("\n- Format: ").append(item.getFormatType());
+            }
+            if (item.getLanguage() != null) {
+                sb.append("\n- Language: ").append(item.getLanguage());
+            }
+            if (item.getLeadTimeHours() != null) {
+                sb.append("\n- Lead Time: ").append(item.getLeadTimeHours()).append("h");
+            }
+            if (item.getHyperlinksType() != null) {
+                sb.append("\n- Hyperlinks: ").append(item.getHyperlinksType());
+            }
+
+            // Traffic & SEO
+            if (item.getSimilarwebVisits() != null) {
+                sb.append("\n- Traffic: ").append(formatVisits(item.getSimilarwebVisits()))
+                  .append(" monthly visits (SimilarWeb)");
+            }
+            if (item.getAhrefsDr() != null || item.getMozDa() != null || item.getSemrushScore() != null) {
+                sb.append("\n- SEO:");
+                if (item.getAhrefsDr() != null)    sb.append(" DR=").append(item.getAhrefsDr());
+                if (item.getMozDa() != null)        sb.append(" DA=").append(item.getMozDa());
+                if (item.getSemrushScore() != null) sb.append(" Semrush=").append(item.getSemrushScore());
+            }
+
+            // Restrictions
+            if (item.getRestrictions() != null && !item.getRestrictions().isEmpty()) {
+                List<String> allowed    = new ArrayList<>();
+                List<String> restricted = new ArrayList<>();
+                item.getRestrictions().forEach((k, v) -> {
+                    if (Boolean.TRUE.equals(v))  allowed.add(k);
+                    if (Boolean.FALSE.equals(v)) restricted.add(k);
+                });
+                if (!allowed.isEmpty())    sb.append("\n- Allowed: ").append(String.join(", ", allowed));
+                if (!restricted.isEmpty()) sb.append("\n- Restricted: ").append(String.join(", ", restricted));
+            }
+
+            // LLM-enriched fields (may be null before enricher runs)
+            if (item.getCategory() != null) {
+                sb.append("\n- Category: ").append(item.getCategory());
+            }
+            if (item.getDescription() != null) {
+                sb.append("\n- Description: ").append(item.getDescription());
+            }
+            if (item.getTags() != null && item.getTags().length > 0) {
+                sb.append("\n- Tags: ").append(Arrays.toString(item.getTags()));
+            }
+            if (item.getAudience() != null && !item.getAudience().isEmpty()) {
+                sb.append("\n- Audience: ").append(item.getAudience());
+            }
+            if (item.getMetrics() != null && !item.getMetrics().isEmpty()) {
+                sb.append("\n- Coverage: ").append(item.getMetrics());
+            }
+            sb.append("\n");
+        }
+
+        sb.append("\nEvaluate each outlet against the campaign brief and return enriched recommendations.");
         return sb.toString();
     }
 
     private RecommendationResponseDTO buildResponse(
-            JsonNode json,
-            List<MediaItem> rawCandidates,
-            String sessionId) {
+            JsonNode json, List<MediaItem> rawCandidates, String sessionId) {
 
-        // Build a lookup map from UUID string → MediaItem for fast resolution
-        Map<String, MediaItem> itemById = new java.util.HashMap<>();
+        Map<String, MediaItem> itemById = new HashMap<>();
         rawCandidates.forEach(item -> itemById.put(item.getId().toString(), item));
 
         List<RecommendationResponseDTO.MediaItemDTO> enriched = new ArrayList<>();
@@ -187,53 +234,71 @@ public class EnrichmentMechanismService {
 
             MediaItem item = itemById.get(idStr);
             if (item == null) {
-                log.warn("[Enrichment] LLM returned unknown media_item_id={}", idStr);
+                log.warn("[Enrichment] unknown media_item_id={}", idStr);
                 return;
             }
 
             enriched.add(RecommendationResponseDTO.MediaItemDTO.builder()
                 .id(item.getId())
                 .title(item.getTitle())
+                .url(item.getUrl())
                 .description(item.getDescription())
                 .category(item.getCategory())
                 .tags(item.getTags())
                 .audience(item.getAudience())
                 .metrics(item.getMetrics())
+                .restrictions(item.getRestrictions())
+                // Structured placement data
+                .costUsd(item.getCostUsd())
+                .similarwebVisits(item.getSimilarwebVisits())
+                .ahrefsDr(item.getAhrefsDr())
+                .mozDa(item.getMozDa())
+                .formatType(item.getFormatType())
+                .language(item.getLanguage())
+                .leadTimeHours(item.getLeadTimeHours())
+                .hyperlinksType(item.getHyperlinksType())
+                // LLM reasoning
                 .matchScore(recNode.path("match_score").asInt(0))
                 .matchReason(recNode.path("match_reason").asText(null))
                 .suggestedFormat(recNode.path("suggested_format").asText(null))
                 .estimatedReach(recNode.path("estimated_reach").asText(null))
+                .budgetFit(recNode.path("budget_fit").asText(null))
                 .build());
         });
 
-        // Sort by matchScore descending (LLM should already sort, but enforce here)
         enriched.sort(Comparator.comparingInt(
             (RecommendationResponseDTO.MediaItemDTO dto) -> dto.getMatchScore() != null ? dto.getMatchScore() : 0
         ).reversed());
 
         return RecommendationResponseDTO.builder()
             .sessionId(sessionId)
+            .reasoning(json.path("reasoning").asText(null))
             .recommendations(enriched)
             .build();
     }
 
-    /**
-     * Fallback response when LLM enrichment fails — returns raw items without enrichment data.
-     */
-    private RecommendationResponseDTO buildFallbackResponse(List<MediaItem> rawCandidates, String sessionId) {
-        log.warn("[Enrichment] using fallback response (no LLM enrichment) for session={}", sessionId);
+    private RecommendationResponseDTO buildFallbackResponse(
+            List<MediaItem> rawCandidates, String sessionId) {
+        log.warn("[Enrichment] fallback (no LLM) for session={}", sessionId);
 
         List<RecommendationResponseDTO.MediaItemDTO> items = rawCandidates.stream()
             .map(item -> RecommendationResponseDTO.MediaItemDTO.builder()
                 .id(item.getId())
                 .title(item.getTitle())
+                .url(item.getUrl())
                 .description(item.getDescription())
                 .category(item.getCategory())
                 .tags(item.getTags())
                 .audience(item.getAudience())
                 .metrics(item.getMetrics())
+                .restrictions(item.getRestrictions())
+                .costUsd(item.getCostUsd())
+                .similarwebVisits(item.getSimilarwebVisits())
+                .ahrefsDr(item.getAhrefsDr())
+                .formatType(item.getFormatType())
+                .language(item.getLanguage())
                 .matchScore(50)
-                .matchReason("Candidate selected based on category and keyword matching.")
+                .matchReason("Selected based on category and keyword match.")
                 .build())
             .toList();
 
@@ -241,5 +306,11 @@ public class EnrichmentMechanismService {
             .sessionId(sessionId)
             .recommendations(items)
             .build();
+    }
+
+    private static String formatVisits(long visits) {
+        if (visits >= 1_000_000) return String.format("%.1fM", visits / 1_000_000.0);
+        if (visits >= 1_000)     return String.format("%.0fK", visits / 1_000.0);
+        return String.valueOf(visits);
     }
 }

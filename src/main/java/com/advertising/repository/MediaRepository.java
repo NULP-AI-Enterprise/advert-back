@@ -16,7 +16,6 @@ import java.util.UUID;
 @Repository
 public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
 
-    // Returns [CAST(id AS text), similarity::double] — entity loaded separately to avoid native-query Object[] casting issues
     @Query(value = """
         SELECT CAST(id AS text), 1 - (embedding <=> CAST(:embedding AS vector)) AS similarity
         FROM media_items
@@ -34,40 +33,22 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
     @Query(value = """
         SELECT CAST(id AS text), 0.5 AS similarity
         FROM media_items
-        WHERE LOWER(title)       LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(description) LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(category)    LIKE LOWER(CONCAT('%', :query, '%'))
-           OR EXISTS (
-               SELECT 1 FROM unnest(tags) t
-               WHERE LOWER(t) LIKE LOWER(CONCAT('%', :query, '%'))
-           )
-        LIMIT :limit
-        """, nativeQuery = true)
-    List<Object[]> findByTextFallback(
-        @Param("query") String query,
-        @Param("limit") int limit
-    );
-
-    @Query(value = "SELECT CAST(id AS text), 0.3 AS similarity FROM media_items ORDER BY created_at DESC LIMIT :limit",
-           nativeQuery = true)
-    List<Object[]> findTopN(@Param("limit") int limit);
-
-    @Query(value = """
-        SELECT CAST(id AS text), 0.5 AS similarity
-        FROM media_items
         WHERE (
               :query = ''
            OR LOWER(title)       LIKE LOWER(CONCAT('%', :query, '%'))
            OR LOWER(description) LIKE LOWER(CONCAT('%', :query, '%'))
            OR LOWER(category)    LIKE LOWER(CONCAT('%', :query, '%'))
+           OR LOWER(format_type) LIKE LOWER(CONCAT('%', :query, '%'))
            OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :query, '%')))
         )
         AND (
               :region = ''
+           OR LOWER(country)               LIKE LOWER(CONCAT('%', :region, '%'))
            OR LOWER(CAST(audience AS text)) LIKE LOWER(CONCAT('%', :region, '%'))
-           OR LOWER(CAST(metrics AS text))  LIKE LOWER(CONCAT('%', :region, '%'))
+           OR LOWER(CAST(metrics  AS text)) LIKE LOWER(CONCAT('%', :region, '%'))
            OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :region, '%')))
         )
+        ORDER BY COALESCE(similarweb_visits, 0) DESC
         LIMIT :limit
         """, nativeQuery = true)
     List<Object[]> findByTextAndRegion(
@@ -77,13 +58,44 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
     );
 
     @Query(value = """
+        SELECT CAST(id AS text), 0.3 AS similarity
+        FROM media_items
+        ORDER BY COALESCE(similarweb_visits, 0) DESC, created_at DESC
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<Object[]> findTopN(@Param("limit") int limit);
+
+    /**
+     * Fallback by reach tier — uses both enricher-generated metrics->>'reach_tier'
+     * and real similarweb_visits so it works even before enrichment runs.
+     */
+    @Query(value = """
         SELECT CAST(id AS text), 0.35 AS similarity
         FROM media_items
-        WHERE metrics->>'reach_tier' = :reachTier
-        ORDER BY created_at DESC
+        WHERE (
+            metrics->>'reach_tier' = :reachTier
+            OR (:reachTier = 'national'  AND similarweb_visits >= 500000)
+            OR (:reachTier = 'regional'  AND similarweb_visits BETWEEN 50000 AND 499999)
+            OR (:reachTier = 'local'     AND similarweb_visits < 50000 AND similarweb_visits > 0)
+        )
+        ORDER BY COALESCE(similarweb_visits, 0) DESC
         LIMIT :limit
         """, nativeQuery = true)
     List<Object[]> findByReachTier(@Param("reachTier") String reachTier, @Param("limit") int limit);
+
+    @Query(value = """
+        SELECT CAST(id AS text), 0.5 AS similarity
+        FROM media_items
+        WHERE LOWER(title)       LIKE LOWER(CONCAT('%', :query, '%'))
+           OR LOWER(description) LIKE LOWER(CONCAT('%', :query, '%'))
+           OR LOWER(category)    LIKE LOWER(CONCAT('%', :query, '%'))
+           OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :query, '%')))
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<Object[]> findByTextFallback(
+        @Param("query") String query,
+        @Param("limit") int limit
+    );
 
     @Modifying
     @Transactional

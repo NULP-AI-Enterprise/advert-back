@@ -7,8 +7,8 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -25,8 +25,64 @@ public class MediaItem {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
+    // ── Core identity ────────────────────────────────────────────────────────
+
     @Column(nullable = false, length = 500)
     private String title;
+
+    @Column(length = 500)
+    private String url;
+
+    @Column(name = "marketplace_url", length = 500)
+    private String marketplaceUrl;
+
+    @Column(length = 100)
+    private String country;
+
+    // ── Placement specs (from PRNEW CSV) ─────────────────────────────────────
+
+    @Column(name = "cost_usd", precision = 10, scale = 2)
+    private BigDecimal costUsd;
+
+    @Column(name = "format_type", length = 50)
+    private String formatType;
+
+    @Column(length = 100)
+    private String language;
+
+    @Column(name = "lead_time_hours")
+    private Integer leadTimeHours;
+
+    @Column(name = "hyperlinks_type", length = 50)
+    private String hyperlinksType;
+
+    // ── Traffic & SEO metrics (from PRNEW CSV) ────────────────────────────────
+
+    @Column(name = "similarweb_visits")
+    private Long similarwebVisits;
+
+    @Column(name = "ahrefs_dr")
+    private Integer ahrefsDr;
+
+    @Column(name = "moz_da")
+    private Integer mozDa;
+
+    @Column(name = "semrush_score")
+    private Integer semrushScore;
+
+    @Column(name = "organic_traffic_ahrefs")
+    private Integer organicTrafficAhrefs;
+
+    @Column(name = "organic_traffic_semrush")
+    private Integer organicTrafficSemrush;
+
+    // ── Content restrictions ({crypto: true, gambling: false, ...}) ───────────
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private Map<String, Object> restrictions;
+
+    // ── LLM-generated fields (populated by enricher) ─────────────────────────
 
     @Column(columnDefinition = "TEXT")
     private String description;
@@ -47,7 +103,7 @@ public class MediaItem {
     @Column(columnDefinition = "jsonb")
     private Map<String, Object> metrics;
 
-    // Hibernate не може читати vector тип — поле виключено з ORM, керується тільки нативними запитами
+    // Hibernate cannot read the vector type — managed only via native SQL
     @Transient
     @JsonIgnore
     private float[] embedding;
