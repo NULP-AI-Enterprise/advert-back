@@ -198,27 +198,35 @@ public class ChatService {
         String quality = topScore >= 80 ? "Strong match" : topScore >= 60 ? "Good match" : "Partial match";
 
         StringBuilder cta = new StringBuilder();
-        cta.append(String.format("Found %d media placement%s. %s — top: **%s** (%d%%)",
-            total, total == 1 ? "" : "s", quality, top.getTitle(), topScore));
+        cta.append(String.format("Found **%d** media placement%s.", total, total == 1 ? "" : "s"));
+        cta.append(String.format(" %s — top: **%s** (%d%%)", quality, top.getTitle(), topScore));
 
-        // Add top match reason snippet if available
-        if (top.getMatchReason() != null && !top.getMatchReason().isBlank()) {
-            String snippet = top.getMatchReason().length() > 90
-                ? top.getMatchReason().substring(0, 87) + "…"
-                : top.getMatchReason();
-            cta.append(". ").append(snippet);
+        // Top outlet quick stats (traffic + cost) — full numbers, no truncation
+        if (top.getSimilarwebVisits() != null && top.getSimilarwebVisits() > 0) {
+            cta.append(String.format(" — %s monthly visits", formatVisits(top.getSimilarwebVisits())));
         }
+        if (top.getCostUsd() != null) {
+            cta.append(String.format(", $%.0f per placement", top.getCostUsd().doubleValue()));
+        }
+        cta.append(".");
 
-        // What would improve results
+        // Hint at what would sharpen results
         List<String> missing = new ArrayList<>();
         if (request.getBudgetUsd() == null) missing.add("budget");
-        if (request.getRegion() == null || request.getRegion().isBlank()) missing.add("target region");
+        if (request.getFormatPreference() == null)
+            missing.add("format (Article, Press Release, or Video)");
         if (!missing.isEmpty()) {
-            cta.append(" For sharper results, tell me your ").append(String.join(" or ", missing)).append(".");
+            cta.append(" For sharper results, share your ").append(String.join(" and ", missing)).append(".");
         }
 
-        cta.append(" I can also create a **Marketing Plan** — just say \"create marketing plan\".");
+        cta.append(" Say **\"create marketing plan\"** for a full channel strategy.");
         return cta.toString();
+    }
+
+    private static String formatVisits(long visits) {
+        if (visits >= 1_000_000) return String.format("%.1fM", visits / 1_000_000.0);
+        if (visits >= 1_000)     return String.format("%.0fK", visits / 1_000.0);
+        return String.valueOf(visits);
     }
 
     private void saveRecommendationContext(String sessionId,

@@ -51,13 +51,21 @@ public class AgenticLoopService {
         defaults for any still-missing fields. Never ask a 4th clarifying question.
 
         LARGE BRIEF: If the user's very first message already contains a product/service AND
-        at least two of (target audience, location, campaign objective, budget) — even described
-        in natural language — set action="search" immediately, do not ask anything.
+        at least two of (target audience, location, campaign objective, budget, format) —
+        even described in natural language — set action="search" immediately, do not ask anything.
 
         EAGER SEARCH: Proceed to search as soon as you know:
         - The product/service being advertised (REQUIRED)
-        - ANY TWO of: target audience, location/region, campaign objective, budget
+        - ANY TWO of: target audience, location/region, campaign objective, budget, format
         Use "awareness" as default objective and null for missing optional fields.
+
+        CLARIFY PRIORITY — when you must ask ONE question, combine the most critical gaps:
+        1. If budget AND format are both unknown: ask both in a single question, e.g.
+           "What's your budget and preferred content format — Article, Press Release, or Video?"
+        2. If only budget unknown: ask budget.
+        3. If only format unknown: ask format.
+        4. Otherwise ask about the most impactful remaining field.
+        Never ask about a field the user already answered or dismissed.
 
         ═══ REASONING STEPS ═══
 
@@ -67,11 +75,13 @@ public class AgenticLoopService {
         3. Campaign objective — explicit or strongly implied.
         4. Region/location — anywhere in history, including device context.
         5. Budget — any currency, any format.
-        6. How many assistant messages are already in the history? (→ MAX CLARIFY rule)
+        6. Format preference — Article, Press Release, Paid news, Video, or not specified.
+        7. Event date — if this is a timed event, extract the date if mentioned.
+        8. How many assistant messages are already in the history? (→ MAX CLARIFY rule)
 
         ═══ ACTIONS ═══
 
-        ACTION "clarify" — ask ONE question for the single most critical missing field.
+        ACTION "clarify" — ask ONE question covering the 1-2 most critical missing fields.
                            Only allowed if fewer than 3 assistant messages exist in history.
         ACTION "search"  — enough context collected; output best-effort search parameters.
         ACTION "plan"    — user explicitly asked to create a marketing plan.
@@ -80,12 +90,15 @@ public class AgenticLoopService {
         search-refinement commands the user can click to narrow or adjust the results —
         NOT generic marketing advice. Good examples:
           "Show only national-reach media"
-          "Filter by video format only"
+          "Filter by Article format only"
+          "Filter by Press Release only"
+          "Filter by Video format only"
           "Create marketing plan"
           "Show top 5 results only"
           "Search in Lviv region instead"
           "Focus on Business category only"
           "Increase to 15 results"
+          "Set budget to $500"
         Bad examples (never generate these):
           "Explore creative strategies"
           "Consider additional regions"
@@ -120,11 +133,30 @@ public class AgenticLoopService {
                 "crypto" → also "blockchain", "digital assets"
         5. Return 5-8 keywords total. Prefer longer, more specific terms over short generic ones.
 
+        ═══ FORMAT EXTRACTION ═══
+
+        Extract `format_preference` if the user specifies a content type:
+        - "Article" — editorial or sponsored article
+        - "Press Release" — formal press release
+        - "Paid news" — paid news placement
+        - "Video" — video content placement
+        - "any" — no preference (default when not mentioned)
+
+        Map naturally: "стаття"/"article"/"post" → "Article"; "відео"/"video" → "Video";
+        "прес-реліз"/"press release" → "Press Release"; "новина"/"news" → "Paid news".
+
+        ═══ EVENT DATE EXTRACTION ═══
+
+        If the campaign is for a timed event (conference, product launch, festival, etc.),
+        extract `event_date` as an ISO date string (YYYY-MM-DD) if a date is mentioned.
+        This helps filter outlets by their lead time — if event_date is close, outlets
+        requiring long lead times will be flagged. Leave null if no date is mentioned.
+
         ═══ GEO EXTRACTION ═══
 
         Extract TWO geo fields:
-        - `region`: the most specific location mentioned (city, district, state) — e.g. "Kyiv", "Berlin", "California"
-        - `country`: the country — e.g. "Ukraine", "Germany", "USA"
+        - `region`: the most specific location mentioned (city, district, state)
+        - `country`: the country
         Both are optional. If only a country is mentioned, leave `region` null.
 
         Respond ONLY in valid JSON — no markdown, no prose outside JSON:
@@ -139,6 +171,8 @@ public class AgenticLoopService {
             "age_range": { "min": 0, "max": 0 },
             "budget_usd": 0,
             "campaign_objective": "awareness|leads|conversions|engagement",
+            "format_preference": "Article|Press Release|Paid news|Video|any",
+            "event_date": "<YYYY-MM-DD or null>",
             "region": "<city or district, or null>",
             "country": "<country name, or null>",
             "max_results": 10
@@ -267,6 +301,14 @@ public class AgenticLoopService {
 
             String country = params.path("country").asText(null);
             if (country != null && !country.isBlank()) builder.country(country);
+
+            String format = params.path("format_preference").asText(null);
+            if (format != null && !format.isBlank() && !"any".equalsIgnoreCase(format))
+                builder.formatPreference(format);
+
+            String eventDate = params.path("event_date").asText(null);
+            if (eventDate != null && !eventDate.isBlank() && !"null".equals(eventDate))
+                builder.eventDate(eventDate);
 
             int maxResults = params.path("max_results").asInt(defaultMaxResults);
             builder.maxResults(maxResults > 0 ? maxResults : defaultMaxResults);

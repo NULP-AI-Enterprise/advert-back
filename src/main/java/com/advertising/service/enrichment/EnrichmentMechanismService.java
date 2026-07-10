@@ -34,61 +34,86 @@ public class EnrichmentMechanismService {
         - cost_usd: actual placement price from the PR marketplace
         - similarweb_visits: verified monthly traffic
         - ahrefs_dr / moz_da: SEO authority scores
-        - format_type: placement format (Article, Press Release, Paid news, etc.)
+        - format_type: placement format (Article, Press Release, Paid news, Video, etc.)
         - language: publication language
+        - lead_time_hours: how many hours in advance the placement must be booked
         - restrictions: content categories allowed or restricted
 
-        Scoring rules:
-        - 80-100: Excellent fit — cost, audience, category, and restrictions all align
+        ═══ SCORING RULES ═══
+
+        - 80-100: Excellent fit — cost, audience, category, format, and restrictions all align
         - 60-79:  Good fit — most factors align, minor gaps
         - 40-59:  Partial fit — useful but not ideal
         - < 30:   Poor fit — EXCLUDE entirely (do not include in response)
 
-        Note: the exclusion threshold is 30, NOT 40. Include marginal candidates — the user
-        can always filter further. A missed good result is worse than an extra mediocre one.
+        The exclusion threshold is 30. Include marginal candidates — a missed result is worse
+        than an extra mediocre one. The user can always filter further.
 
-        Budget guidance (use exact cost_usd, not vague tiers):
-        - If cost_usd > budget * 0.5: flag as expensive, reduce score by 20
-        - If cost_usd > budget: EXCLUDE unless the outlet is exceptionally strong
-        - For multi-placement campaigns: consider how many placements fit in budget
+        ═══ BUDGET GUIDANCE ═══
 
-        Restriction check — read carefully:
-        - ONLY EXCLUDE if the specific content type is EXPLICITLY set to false
+        Use exact cost_usd values, never vague tiers:
+        - cost_usd > budget × 0.5 → flag as expensive, reduce score by 20
+        - cost_usd > budget → EXCLUDE unless outlet is exceptionally strong (score 85+)
+        - No budget specified → do not penalize any outlet for cost; mention cost in reasoning
+
+        ═══ FORMAT MATCHING ═══
+
+        If the campaign brief specifies a format_preference:
+        - Exact match (outlet format_type = preference) → boost score +10
+        - No format_preference specified → use objective to suggest best format:
+          leads/conversions → "Article" or "Paid news"
+          awareness → "Press Release" or "Article"
+          engagement → "Video" if available, else "Article"
+        - Always return the best available format in suggested_format
+
+        ═══ EVENT DATE / LEAD TIME CHECK ═══
+
+        If event_date is provided in the brief:
+        - Calculate days until event from today's date
+        - If outlet's lead_time_hours / 24 > days_until_event → flag as "may be too late to book"
+        - If lead_time feasible → boost score +5 and mention it in match_reason
+
+        ═══ RESTRICTION CHECK ═══
+
+        - ONLY EXCLUDE if the specific content type is EXPLICITLY set to false in restrictions
           (e.g., restrictions contains crypto: false → crypto content is FORBIDDEN).
-        - If the key is ABSENT from restrictions or restrictions is empty → content is PERMITTED.
-          Absence of a key means "not restricted", NOT "not allowed". Do NOT exclude.
-        - If the key is true → content is explicitly ALLOWED, boost score by +5.
+        - Key ABSENT from restrictions or restrictions is empty → content is PERMITTED.
+          Absence means "not restricted", NOT "not allowed". Do NOT exclude.
+        - Key is true → content explicitly ALLOWED, boost score by +5.
 
-        Pre-enrichment handling:
-        - Some outlets may have no description, tags, or audience data (still being processed).
-        - In that case, infer the editorial focus from the outlet's NAME and URL:
-            "ain.ua" → Ukrainian tech/startup news (score as Technology)
-            "itc.ua" → Ukrainian IT media
-            "dou.ua" → Ukrainian developers community
-            "tsn.ua" → national Ukrainian TV news (broad reach)
-            "unian.ua" → national Ukrainian news agency
-          Apply this logic broadly: a .ua domain with "tech", "it", "digit", "soft",
-          "start", "code", "dev", "data" in its name → treat as Technology outlet.
-        - For high-traffic national outlets (similarweb_visits > 1M) without description:
-          base score 60 — they reach mass audiences relevant to any awareness campaign.
-        - For unknown/medium outlets without description: base score 50.
-        - NEVER score below 30 solely because description is missing.
+        ═══ PRE-ENRICHMENT HANDLING ═══
+
+        Some outlets may have no description, tags, or audience data (still being enriched).
+        In that case, infer editorial focus from NAME and URL:
+          "ain.ua" → Ukrainian tech/startup news (Technology)
+          "itc.ua" → Ukrainian IT media (Technology)
+          "dou.ua" → Ukrainian developers community (Technology)
+          "tsn.ua" → national Ukrainian TV news (broad reach)
+          "unian.ua" → national Ukrainian news agency
+        Apply broadly: a .ua domain with "tech", "it", "digit", "soft", "start", "code",
+        "dev", "data" in its name → treat as Technology outlet.
+        High-traffic national outlets (similarweb_visits > 1M) without description: base score 60.
+        Unknown/medium outlets without description: base score 50.
+        NEVER score below 30 solely because description is missing.
+
+        ═══ OUTPUT FORMAT ═══
 
         For each included item provide:
-        - match_score: 40-100
-        - match_reason: 2-3 sentences citing SPECIFIC numbers. Example:
-          "1.6M monthly visits (SimilarWeb) with DR=77 — strong SEO authority.
-          Cost $130 fits well within $2000 budget (15% of monthly spend).
-          Ukrainian + Russian language aligns with target audience."
-        - suggested_format: best format for this campaign from available format_type
-          (for leads → Article or Paid news; for awareness → Press Release)
-        - estimated_reach: concrete estimate, e.g. "~1.6M monthly readers, national reach"
-        - budget_fit: how cost fits, e.g. "costs $130 of $2000 budget — fits 15× per month"
+        - match_score: 30-100
+        - match_reason: 2-3 sentences citing SPECIFIC data points. Always mention:
+            • Traffic (e.g. "1.6M monthly visits, DR=77")
+            • Cost vs budget (e.g. "$130 of $2000 — 6.5% of budget")
+            • Why the audience matches the campaign
+            • Format suitability and lead time feasibility if event_date was given
+        - suggested_format: best format for this campaign (use format_type values available)
+        - estimated_reach: concrete estimate, e.g. "~1.6M monthly readers, national Ukraine"
+        - budget_fit: short budget analysis, e.g. "$130 of $2000 — fits 15× per month"
 
         Also return a top-level `reasoning` field (3-5 sentences) explaining:
-        - What the overall budget allows
-        - Why the selected outlets match the target audience
-        - Any notable trade-offs or gaps
+        - What the overall budget allows across selected placements
+        - Why the selected outlets match the target audience and campaign objective
+        - Format strategy — which formats were chosen and why
+        - Any notable trade-offs, timing risks, or gaps
 
         Return ONLY valid JSON — no markdown, no prose:
         {
@@ -96,7 +121,7 @@ public class EnrichmentMechanismService {
           "recommendations": [
             {
               "media_item_id": "uuid-string",
-              "match_score": 40-100,
+              "match_score": 30-100,
               "match_reason": "string",
               "suggested_format": "string",
               "estimated_reach": "string",
@@ -164,6 +189,13 @@ public class EnrichmentMechanismService {
         }
         if (request.getRegion() != null) {
             sb.append("- Region: ").append(request.getRegion()).append("\n");
+        }
+        if (request.getFormatPreference() != null) {
+            sb.append("- Format Preference: ").append(request.getFormatPreference()).append("\n");
+        }
+        if (request.getEventDate() != null) {
+            sb.append("- Event Date: ").append(request.getEventDate())
+              .append(" (check lead_time_hours for each outlet to ensure booking is still possible)\n");
         }
         if (request.getRelaxationNote() != null) {
             sb.append("- Note: ").append(request.getRelaxationNote()).append("\n");
