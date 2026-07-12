@@ -38,20 +38,35 @@ public class ChatHistoryService {
         String cacheKey = keyPrefix + sessionId;
 
         return Mono.fromCallable(() -> {
+            log.debug("[ChatHistory] getRecentHistory session={} limit={} key={}", sessionId, limit, cacheKey);
             Object cached = redisTemplate.opsForValue().get(cacheKey);
             if (cached != null) {
-                return objectMapper.convertValue(cached, new TypeReference<List<ChatMessage>>() {});
+                List<ChatMessage> messages = objectMapper.convertValue(cached, new TypeReference<List<ChatMessage>>() {});
+                log.info("[ChatHistory] cache HIT session={} messages={}", sessionId, messages.size());
+                return messages;
             }
 
+            log.info("[ChatHistory] cache MISS session={} — querying DB limit={}", sessionId, limit);
             List<ChatMessage> messages = messageRepository
                 .findLatestBySessionId(UUID.fromString(sessionId), limit);
-
+            log.info("[ChatHistory] DB returned {} messages for session={}", messages.size(), sessionId);
+            if (!messages.isEmpty()) {
+                log.debug("[ChatHistory] messages preview: {}",
+                    messages.stream().limit(3)
+                        .map(m -> "[" + m.getRole() + "] "
+                            + (m.getContent().length() > 60
+                                ? m.getContent().substring(0, 60) + "…"
+                                : m.getContent()))
+                        .toList());
+            }
             redisTemplate.opsForValue().set(cacheKey, messages, Duration.ofHours(ttlHours));
+            log.debug("[ChatHistory] cached {} messages session={} TTL={}h", messages.size(), sessionId, ttlHours);
             return messages;
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
     public void invalidateCache(String sessionId) {
+        log.debug("[ChatHistory] invalidating cache session={}", sessionId);
         redisTemplate.delete(keyPrefix + sessionId);
     }
 }

@@ -43,17 +43,21 @@ public class OpenAIService {
      */
     public Mono<String> chatCompletion(List<Map<String, String>> messages) {
         ObjectNode body = buildChatRequestBody(messages, false);
+        logRequest("chatCompletion", messages);
+        long startMs = System.currentTimeMillis();
 
         return webClient.post()
             .uri("/chat/completions")
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .doOnNext(response -> logResponse("chatCompletion", response, startMs))
             .map(response -> response
                 .path("choices").get(0)
                 .path("message").path("content").asText()
             )
-            .doOnError(e -> log.error("OpenAI chat completion failed", e));
+            .doOnError(e -> log.error("[OpenAI] chatCompletion failed after {}ms: {}",
+                System.currentTimeMillis() - startMs, e.getMessage(), e));
     }
 
     /**
@@ -61,6 +65,8 @@ public class OpenAIService {
      */
     public Flux<String> chatCompletionStream(List<Map<String, String>> messages) {
         ObjectNode body = buildChatRequestBody(messages, true);
+        logRequest("chatCompletionStream", messages);
+        long startMs = System.currentTimeMillis();
 
         return webClient.post()
             .uri("/chat/completions")
@@ -75,26 +81,32 @@ public class OpenAIService {
                     return node.path("choices").get(0)
                                .path("delta").path("content").asText(null);
                 } catch (Exception e) {
-                    log.warn("Failed to parse stream chunk: {}", json);
+                    log.warn("[OpenAI] chatCompletionStream failed to parse chunk: {}", json);
                     return null;
                 }
             })
-            .filter(chunk -> chunk != null && !chunk.isEmpty());
+            .filter(chunk -> chunk != null && !chunk.isEmpty())
+            .doOnSubscribe(s -> log.debug("[OpenAI] chatCompletionStream started model={} messages={}", chatModel, messages.size()))
+            .doOnComplete(() -> log.info("[OpenAI] chatCompletionStream complete in {}ms", System.currentTimeMillis() - startMs))
+            .doOnError(e -> log.error("[OpenAI] chatCompletionStream failed after {}ms: {}",
+                System.currentTimeMillis() - startMs, e.getMessage(), e));
     }
 
     /**
      * JSON-mode completion — forces the model to return valid JSON.
-     * Use for structured outputs (search params, plan skeleton).
      */
     public Mono<JsonNode> chatCompletionJson(List<Map<String, String>> messages) {
         ObjectNode body = buildChatRequestBody(messages, false);
         body.putObject("response_format").put("type", "json_object");
+        logRequest("chatCompletionJson", messages);
+        long startMs = System.currentTimeMillis();
 
         return webClient.post()
             .uri("/chat/completions")
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .doOnNext(response -> logResponse("chatCompletionJson", response, startMs))
             .map(response -> {
                 String content = response
                     .path("choices").get(0)
@@ -109,8 +121,6 @@ public class OpenAIService {
 
     /**
      * Structured-output completion — guarantees the response matches the provided JSON Schema.
-     * Uses OpenAI's json_schema response_format with strict=true.
-     * Eliminates prompt-based JSON description and prevents hallucinated field names.
      */
     public Mono<JsonNode> chatCompletionStructured(
             List<Map<String, String>> messages,
@@ -125,11 +135,15 @@ public class OpenAIService {
         jsonSchema.put("strict", true);
         jsonSchema.set("schema", schema);
 
+        logRequest("chatCompletionStructured[" + schemaName + "]", messages);
+        long startMs = System.currentTimeMillis();
+
         return webClient.post()
             .uri("/chat/completions")
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .doOnNext(response -> logResponse("chatCompletionStructured[" + schemaName + "]", response, startMs))
             .map(response -> {
                 String content = response
                     .path("choices").get(0)
@@ -140,14 +154,19 @@ public class OpenAIService {
                     throw new RuntimeException("OpenAI structured output returned invalid JSON: " + content, e);
                 }
             })
-            .doOnError(e -> log.error("OpenAI structured completion failed: {}", e.getMessage()));
+            .doOnError(e -> log.error("[OpenAI] chatCompletionStructured[{}] failed after {}ms: {}",
+                schemaName, System.currentTimeMillis() - startMs, e.getMessage()));
     }
 
     /**
      * Generates an embedding vector for the provided text.
-     * Used for pgvector similarity search.
      */
     public Mono<float[]> createEmbedding(String text) {
+        log.info("[OpenAI] createEmbedding model={} text_chars={} preview='{}'",
+            embeddingModel, text.length(),
+            text.length() > 120 ? text.substring(0, 120) + "…" : text);
+        long startMs = System.currentTimeMillis();
+
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", embeddingModel);
         body.put("input", text);
@@ -163,8 +182,64 @@ public class OpenAIService {
                 for (int i = 0; i < embeddingArray.size(); i++) {
                     vector[i] = (float) embeddingArray.get(i).asDouble();
                 }
+                JsonNode usage = response.path("usage");
+                log.info("[OpenAI] createEmbedding ← {}ms dims={} tokens={}",
+                    System.currentTimeMillis() - startMs,
+                    vector.length,
+                    usage.path("total_tokens").asInt(0));
                 return vector;
-            });
+            })
+            .doOnError(e -> log.error("[OpenAI] createEmbedding failed after {}ms: {}",
+                System.currentTimeMillis() - startMs, e.getMessage(), e));
+    }
+
+    // ── Private helpers ─────────────────────────────────────────────────────────
+
+    private void logRequest(String method, List<Map<String, String>> messages) {
+        String systemContent = messages.stream()
+            .filter(m -> "system".equals(m.get("role")))
+            .findFirst().map(m -> m.get("content")).orElse("");
+        String lastUserContent = messages.stream()
+            .filter(m -> "user".equals(m.get("role")))
+            .reduce((a, b) -> b)
+            .map(m -> m.get("content")).orElse("");
+
+        log.info("[OpenAI] → {} model={} messages={} system_chars={} user_preview='{}'",
+            method, chatModel, messages.size(), systemContent.length(),
+            lastUserContent.length() > 200 ? lastUserContent.substring(0, 200) + "…" : lastUserContent);
+
+        log.debug("[OpenAI] {} full_message_list:", method);
+        for (int i = 0; i < messages.size(); i++) {
+            Map<String, String> msg = messages.get(i);
+            String role    = msg.getOrDefault("role", "?");
+            String content = msg.getOrDefault("content", "");
+            log.debug("[OpenAI]   [{}] role={} chars={} content='{}'",
+                i, role, content.length(),
+                content.length() > 300 ? content.substring(0, 300) + "…" : content);
+        }
+    }
+
+    private void logResponse(String method, JsonNode response, long startMs) {
+        long ms = System.currentTimeMillis() - startMs;
+        JsonNode usage       = response.path("usage");
+        JsonNode choicesNode = response.path("choices");
+        String finishReason  = choicesNode.size() > 0
+            ? choicesNode.get(0).path("finish_reason").asText("?") : "?";
+        int promptTokens     = usage.path("prompt_tokens").asInt(0);
+        int completionTokens = usage.path("completion_tokens").asInt(0);
+        int totalTokens      = usage.path("total_tokens").asInt(0);
+
+        log.info("[OpenAI] ← {} {}ms finish={} tokens={}p+{}c={}total",
+            method, ms, finishReason, promptTokens, completionTokens, totalTokens);
+
+        if (choicesNode.size() > 0) {
+            String content = choicesNode.get(0).path("message").path("content").asText("");
+            if (!content.isBlank()) {
+                log.debug("[OpenAI] {} response_content chars={} preview='{}'",
+                    method, content.length(),
+                    content.length() > 600 ? content.substring(0, 600) + "…" : content);
+            }
+        }
     }
 
     private ObjectNode buildChatRequestBody(List<Map<String, String>> messages, boolean stream) {

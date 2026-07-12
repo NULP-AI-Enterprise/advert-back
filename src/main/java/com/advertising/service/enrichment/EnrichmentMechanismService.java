@@ -228,10 +228,19 @@ public class EnrichmentMechanismService {
 
         EventDateContext eventCtx = parseEventDate(request.getEventDate());
 
+        String userPrompt = buildUserPrompt(rawCandidates, request, eventCtx);
+        log.info("[Enrichment] user_prompt_chars={} candidates={} session={}",
+            userPrompt.length(), rawCandidates.size(), sid);
+        log.debug("[Enrichment] user_prompt_preview: '{}'",
+            userPrompt.length() > 800 ? userPrompt.substring(0, 800) + "…" : userPrompt);
+
         List<Map<String, String>> messages = List.of(
             Map.of("role", "system", "content", SYSTEM_PROMPT),
-            Map.of("role", "user",   "content", buildUserPrompt(rawCandidates, request, eventCtx))
+            Map.of("role", "user",   "content", userPrompt)
         );
+
+        log.info("[Enrichment] → scoring LLM system_chars={} user_chars={} schema=enrichment_response",
+            SYSTEM_PROMPT.length(), userPrompt.length());
 
         return openAIService.chatCompletionStructured(messages, "enrichment_response", enrichmentSchema)
             .doOnNext(json -> {

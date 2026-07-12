@@ -49,7 +49,9 @@ public class ChatService {
     private static final Duration REC_CONTEXT_TTL = Duration.ofHours(24);
 
     public Flux<WebSocketMessage> processMessage(String sessionId, String userContent, Object rawPayload) {
-        log.info("[Chat] processMessage session={}", sessionId);
+        log.info("[Chat] processMessage session={} msg_len={} preview='{}'",
+            sessionId, userContent.length(),
+            userContent.length() > 150 ? userContent.substring(0, 150) + "…" : userContent);
 
         // Per-request debug sink — buffers events until the subscriber (WebSocket handler) drains them
         Sinks.Many<WebSocketMessage> debugSink = Sinks.many().unicast().onBackpressureBuffer();
@@ -80,8 +82,12 @@ public class ChatService {
         final String finalDeviceLocation = deviceLocation;
         final String finalDeviceLanguage = deviceLanguage;
 
+        log.info("[Chat] device context: location={} language={}", deviceLocation, deviceLanguage);
+
         // Load previous recommendation context from Redis
         String previousContext = loadPreviousContext(sessionId);
+        log.info("[Chat] previous context: {} (session={})",
+            previousContext != null ? previousContext.length() + " chars" : "none", sessionId);
 
         Flux<WebSocketMessage> mainFlux = Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.user, userContent))
             .subscribeOn(Schedulers.boundedElastic())
@@ -105,9 +111,11 @@ public class ChatService {
 
     private Flux<WebSocketMessage> handleDecision(String sessionId, AgenticLoopService.AgentDecision decision,
                                                    java.util.function.Consumer<WebSocketMessage> debug) {
-        log.info("[Chat] decision={}", decision.getClass().getSimpleName());
+        log.info("[Chat] decision={} session={}", decision.getClass().getSimpleName(), sessionId);
 
         if (decision instanceof AgenticLoopService.AgentDecision.Clarify c) {
+            log.info("[Chat] CLARIFY → session={} question_preview='{}'",
+                sessionId, c.question().length() > 100 ? c.question().substring(0, 100) + "…" : c.question());
             return Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.assistant, c.question()))
                 .subscribeOn(Schedulers.boundedElastic())
                 .thenReturn(WebSocketMessage.builder()
@@ -123,10 +131,22 @@ public class ChatService {
         }
 
         AgenticLoopService.AgentDecision.Search s = (AgenticLoopService.AgentDecision.Search) decision;
-        log.info("[Chat] search categories={} region={}", s.request().getCategories(), s.request().getRegion());
+        log.info("[Chat] SEARCH → session={} categories={} keywords={} region='{}' country='{}' budget={} format='{}' maxResults={}",
+            sessionId,
+            s.request().getCategories(),
+            s.request().getKeywords(),
+            s.request().getRegion(),
+            s.request().getCountry(),
+            s.request().getBudgetUsd() != null ? "$" + s.request().getBudgetUsd() : "null",
+            s.request().getFormatPreference(),
+            s.request().getMaxResults());
 
         return recEngineService.findCandidates(s.request(), debug)
+            .doOnNext(candidates -> log.info("[Chat] RecEngine returned {} candidates session={}",
+                candidates.size(), sessionId))
             .flatMap(candidates -> enrichmentMechanismService.enrich(candidates, s.request(), debug))
+            .doOnNext(recs -> log.info("[Chat] Enrichment returned {} recommendations session={}",
+                recs.getRecommendations().size(), sessionId))
             .flatMapMany(recs -> {
                 // Save context to Redis for next query and marketing plan
                 saveRecommendationContext(sessionId, recs, s.request());
@@ -324,6 +344,7 @@ public class ChatService {
     private void saveRecommendationContext(String sessionId,
                                             RecommendationResponseDTO recs,
                                             RecommendationRequestDTO request) {
+        log.debug("[Chat][Redis] saving recommendation context session={} recs={}", sessionId, recs.getRecommendations().size());
         try {
             String topTitles = recs.getRecommendations().stream().limit(3)
                 .map(RecommendationResponseDTO.MediaItemDTO::getTitle)
@@ -363,16 +384,27 @@ public class ChatService {
             }
 
             redisTemplate.opsForValue().set(REC_CONTEXT_PREFIX + sessionId, fullContext, REC_CONTEXT_TTL);
+            log.info("[Chat][Redis] saved rec context session={} chars={} TTL={}",
+                sessionId, fullContext.length(), REC_CONTEXT_TTL);
         } catch (Exception e) {
             log.warn("[Chat] failed to save rec context to Redis: {}", e.getMessage());
         }
     }
 
     private String loadPreviousContext(String sessionId) {
+        log.debug("[Chat][Redis] loading previous context session={}", sessionId);
         try {
             Object cached = redisTemplate.opsForValue().get(REC_CONTEXT_PREFIX + sessionId);
-            if (cached instanceof String s) return s;
-            if (cached != null) return cached.toString();
+            if (cached instanceof String s) {
+                log.info("[Chat][Redis] loaded context session={} chars={}", sessionId, s.length());
+                return s;
+            }
+            if (cached != null) {
+                String s = cached.toString();
+                log.info("[Chat][Redis] loaded context (non-string) session={} chars={}", sessionId, s.length());
+                return s;
+            }
+            log.debug("[Chat][Redis] no previous context for session={}", sessionId);
         } catch (Exception e) {
             log.debug("[Chat] no previous context for session {}", sessionId);
         }
@@ -380,9 +412,13 @@ public class ChatService {
     }
 
     private void doSave(String sessionId, ChatMessage.MessageRole role, String content) {
+        log.debug("[Chat][DB] saving message role={} session={} content_chars={} preview='{}'",
+            role, sessionId, content.length(),
+            content.length() > 120 ? content.substring(0, 120) + "…" : content);
         ChatSession session = sessionRepository.findById(UUID.fromString(sessionId))
             .orElseThrow(() -> new IllegalArgumentException("Session not found: " + sessionId));
-        messageRepository.save(ChatMessage.builder()
+        ChatMessage saved = messageRepository.save(ChatMessage.builder()
             .session(session).role(role).content(content).build());
+        log.info("[Chat][DB] persisted message id={} role={} session={}", saved.getId(), role, sessionId);
     }
 }

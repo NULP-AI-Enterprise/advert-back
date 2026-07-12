@@ -275,6 +275,18 @@ public class AgenticLoopService {
 
                 List<Map<String, String>> messages = buildMessageList(
                     history, userMessage, deviceLocation, deviceLanguage, previousContext, clarifyCount);
+
+                log.info("[Agentic] → router LLM total_messages={} history_turns={} clarify_count={} results_shown={}",
+                    messages.size(), history.size(), clarifyCount, resultsShown);
+                log.debug("[Agentic] full message list ({} messages):", messages.size());
+                for (int i = 0; i < messages.size(); i++) {
+                    String role    = messages.get(i).getOrDefault("role", "?");
+                    String content = messages.get(i).getOrDefault("content", "");
+                    log.debug("[Agentic]   [{}] role={} chars={} preview='{}'",
+                        i, role, content.length(),
+                        content.length() > 250 ? content.substring(0, 250) + "…" : content);
+                }
+
                 return openAIService.chatCompletionStructured(messages, "router_response", routerSchema);
             })
             .map(json -> {

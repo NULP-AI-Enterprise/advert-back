@@ -103,8 +103,11 @@ public class RecEngineService {
         if (!embeddingJson.isBlank()) {
             String formatFilter = request.getFormatPreference() != null
                 ? request.getFormatPreference() : "";
+            log.info("[RecEngine][DB] findSimilarByEmbeddingFiltered threshold={} limit={} format='{}'",
+                VECTOR_THRESHOLD, fetchLimit, formatFilter.isEmpty() ? "any" : formatFilter);
             List<Object[]> vecRows = mediaRepository.findSimilarByEmbeddingFiltered(
                 embeddingJson, VECTOR_THRESHOLD, fetchLimit, formatFilter);
+            log.info("[RecEngine][DB] findSimilarByEmbeddingFiltered returned {} rows", vecRows.size());
             // Build id→score map before resolving to keep similarity values
             Map<String, Double> scores = new LinkedHashMap<>();
             for (Object[] row : vecRows) scores.put((String) row[0], ((Number) row[1]).doubleValue());
@@ -134,9 +137,12 @@ public class RecEngineService {
                        "top_hits",      topHits));
 
             if (pool.size() < targetLimit / 2) {
-                log.info("[RecEngine] sparse vector results, retrying at threshold=0.45");
+                log.info("[RecEngine] sparse vector results (pool={}), retrying at threshold=0.45", pool.size());
+                log.info("[RecEngine][DB] findSimilarByEmbeddingFiltered retry threshold=0.45 limit={} format='{}'",
+                    fetchLimit, formatFilter.isEmpty() ? "any" : formatFilter);
                 List<Object[]> retryRows = mediaRepository.findSimilarByEmbeddingFiltered(
                     embeddingJson, 0.45, fetchLimit, formatFilter);
+                log.info("[RecEngine][DB] retry returned {} rows", retryRows.size());
                 Map<String, Double> retryScores = new LinkedHashMap<>();
                 for (Object[] row : retryRows) retryScores.put((String) row[0], ((Number) row[1]).doubleValue());
 
@@ -197,7 +203,9 @@ public class RecEngineService {
             List<Map<String, Object>> catResults = new ArrayList<>();
             for (String cat : request.getCategories()) {
                 int bCat = pool.size();
+                log.debug("[RecEngine][DB] findByCategory category='{}' limit={}", cat, fetchLimit);
                 List<MediaItem> catItems = resolveItems(mediaRepository.findByCategory(cat, fetchLimit));
+                log.debug("[RecEngine][DB] findByCategory category='{}' returned {} items", cat, catItems.size());
                 catItems.forEach(item -> addToPool(item, pool, seenKeys));
                 catResults.add(Map.of(
                     "category", cat,
@@ -220,7 +228,9 @@ public class RecEngineService {
             log.info("[RecEngine] pool={} / target={} — padding with top-traffic items",
                 pool.size(), targetLimit);
             int before4b = pool.size();
+            log.info("[RecEngine][DB] findTopN limit={}", fetchLimit * 2);
             List<MediaItem> topItems = resolveItems(mediaRepository.findTopN(fetchLimit * 2));
+            log.info("[RecEngine][DB] findTopN returned {} items", topItems.size());
             topItems.forEach(item -> addToPool(item, pool, seenKeys));
             DebugEvents.emit(debug, sid, "search", "top_traffic",
                 "L4b Top-Traffic Padding (no keyword match found)",
@@ -273,7 +283,9 @@ public class RecEngineService {
         for (String kw : keywords) {
             if (kw.length() < 4) continue;
             int before = pool.size();
+            log.debug("[RecEngine][DB] findByTextAndRegion keyword='{}' region='{}' limit={}", kw, region, limit);
             List<Object[]> rows = mediaRepository.findByTextAndRegion(kw, region, limit);
+            log.debug("[RecEngine][DB] findByTextAndRegion keyword='{}' returned {} rows", kw, rows.size());
             List<MediaItem> found = resolveItems(rows);
             found.forEach(item -> addToPool(item, pool, seenKeys));
 
@@ -364,8 +376,11 @@ public class RecEngineService {
         List<UUID> ids = rows.stream()
             .map(row -> UUID.fromString((String) row[0]))
             .toList();
+        log.debug("[RecEngine][DB] findAllById count={} ids_preview={}",
+            ids.size(), ids.stream().limit(3).map(UUID::toString).toList());
         Map<UUID, MediaItem> byId = mediaRepository.findAllById(ids).stream()
             .collect(Collectors.toMap(MediaItem::getId, Function.identity()));
+        log.debug("[RecEngine][DB] findAllById resolved {}/{} items", byId.size(), ids.size());
         // Preserve the original order (sorted by traffic from SQL)
         return ids.stream()
             .map(byId::get)
