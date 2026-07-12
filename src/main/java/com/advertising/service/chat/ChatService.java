@@ -128,6 +128,10 @@ public class ChatService {
                     recs.setReasoning(s.request().getRelaxationNote());
                 }
 
+                Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.assistant, ctaMessage))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .subscribe(null, err -> log.warn("[Chat] failed to persist rec message: {}", err.getMessage()));
+
                 WebSocketMessage recsMsg = WebSocketMessage.builder()
                     .type(WebSocketMessage.MessageType.RECOMMENDATIONS_READY)
                     .sessionId(sessionId)
@@ -143,10 +147,14 @@ public class ChatService {
             .subscribeOn(Schedulers.boundedElastic())
             .flatMap(context -> {
                 if (context == null || context.isBlank()) {
+                    String noCtx = "No recent recommendations found. Please describe your campaign first to get media placements, then I can create a marketing plan.";
+                    Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.assistant, noCtx))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe(null, err -> log.warn("[Chat] failed to persist no-context message: {}", err.getMessage()));
                     return Mono.just(WebSocketMessage.builder()
                         .type(WebSocketMessage.MessageType.ASSISTANT_MESSAGE)
                         .sessionId(sessionId)
-                        .content("No recent recommendations found. Please describe your campaign first to get media placements, then I can create a marketing plan.")
+                        .content(noCtx)
                         .build());
                 }
 
@@ -180,6 +188,10 @@ public class ChatService {
                 );
 
                 return openAIService.chatCompletionJson(messages)
+                    .doOnSuccess(planJson -> Mono.fromRunnable(() ->
+                            doSave(sessionId, ChatMessage.MessageRole.assistant, "Marketing plan ready — see the panel on the right."))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe(null, err -> log.warn("[Chat] failed to persist plan message: {}", err.getMessage())))
                     .map(planJson -> WebSocketMessage.builder()
                         .type(WebSocketMessage.MessageType.MARKETING_PLAN_READY)
                         .sessionId(sessionId)
