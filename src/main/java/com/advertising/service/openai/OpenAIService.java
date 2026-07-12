@@ -10,9 +10,12 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -38,6 +41,14 @@ public class OpenAIService {
     @Value("${openai.temperature}")
     private double temperature;
 
+    // Retry on 429 (rate-limit) with exponential backoff: 2s → 4s → 8s (3 attempts).
+    // Tier 1 OpenAI accounts hit 30K TPM limits; a short wait usually clears the window.
+    private static final Retry RATE_LIMIT_RETRY = Retry.backoff(3, Duration.ofSeconds(2))
+        .maxBackoff(Duration.ofSeconds(16))
+        .filter(t -> t instanceof WebClientResponseException e && e.getStatusCode().value() == 429)
+        .doBeforeRetry(signal -> log.warn("[OpenAI] 429 rate-limit — retry #{} after backoff",
+            signal.totalRetries() + 1));
+
     /**
      * Standard chat completion — returns the full assistant message.
      */
@@ -51,6 +62,7 @@ public class OpenAIService {
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .retryWhen(RATE_LIMIT_RETRY)
             .doOnNext(response -> logResponse("chatCompletion", response, startMs))
             .map(response -> response
                 .path("choices").get(0)
@@ -106,6 +118,7 @@ public class OpenAIService {
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .retryWhen(RATE_LIMIT_RETRY)
             .doOnNext(response -> logResponse("chatCompletionJson", response, startMs))
             .map(response -> {
                 String content = response
@@ -143,6 +156,7 @@ public class OpenAIService {
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode.class)
+            .retryWhen(RATE_LIMIT_RETRY)
             .doOnNext(response -> logResponse("chatCompletionStructured[" + schemaName + "]", response, startMs))
             .map(response -> {
                 String content = response

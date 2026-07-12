@@ -394,7 +394,7 @@ public class RecEngineService {
             allCandidates.size(), enrichedCount, allCandidates.size() - enrichedCount);
 
         DebugEvents.emit(debug, sid, "search", "final_pool",
-            "Final Candidate Pool (" + pool.size() + " → Enrichment LLM)",
+            "Raw Pool (" + pool.size() + " collected, trimming to enrichment batch)",
             Map.of("total_candidates", pool.size(),
                    "target_results",   targetLimit,
                    "pool_cap",         poolCap,
@@ -402,7 +402,202 @@ public class RecEngineService {
                                                "category", countCategory, "top_traffic", countTopTraffic),
                    "enriched_count",   enrichedCount,
                    "candidates",       allCandidates));
-        return new ArrayList<>(pool.values());
+
+        // ── Pre-rank and trim before sending to enrichment LLM ────────────────
+        // 187 items ≈ 40K+ tokens — exceeds GPT-4o Tier 1 TPM limit (30K).
+        // Pre-rank with fast, signal-only heuristics so we send the BEST N candidates.
+        // N = max(targetLimit * 6, 60) gives the LLM 6× options without token pressure.
+        int enrichBatchSize = Math.max(targetLimit * 6, 60);
+        List<MediaItem> ranked = preRankAndTrim(new ArrayList<>(pool.values()), request, enrichBatchSize, debug, sid);
+
+        log.info("[RecEngine] → enrichment LLM: {} candidates (trimmed from {} pool, target={})",
+            ranked.size(), pool.size(), targetLimit);
+        return ranked;
+    }
+
+    /**
+     * Pre-ranks candidates using observable DB signals (no LLM) and returns the top N.
+     * Emits a debug event with EVERY candidate's score + per-signal breakdown.
+     *
+     * Scoring signals:
+     *  +30  category matches requested categories
+     *  +40/30/20/10  traffic tier (>5M / >1M / >100K / else)
+     *  +20  enriched (has description from LLM enricher)
+     *  +10  SEO DR ≥ 50
+     *  +5   SEO DA ≥ 40
+     *  +10  cost ≤ budget
+     *  −20  cost > budget × 3
+     *  +15  format matches preference
+     */
+    private record ScoredCandidate(MediaItem item, double score, List<String> signals) {}
+
+    private List<MediaItem> preRankAndTrim(List<MediaItem> candidates,
+                                            RecommendationRequestDTO request,
+                                            int maxItems,
+                                            Consumer<WebSocketMessage> debug,
+                                            String sid) {
+        if (candidates.size() <= maxItems) {
+            log.info("[RecEngine][PreRank] pool={} ≤ enrichBatchSize={} — no trim needed",
+                candidates.size(), maxItems);
+            // Still emit an event so the debug panel always shows the step
+            DebugEvents.emit(debug, sid, "search", "pre_rank",
+                "Pre-Rank: all " + candidates.size() + " candidates fit — no trim",
+                Map.of("pool_in", candidates.size(), "batch_out", candidates.size(),
+                       "dropped", 0, "trim_needed", false));
+            return candidates;
+        }
+
+        List<String> requestedCats = request.getCategories() != null ? request.getCategories() : List.of();
+        Double budget = request.getBudgetUsd();
+        String format = request.getFormatPreference();
+
+        log.info("[RecEngine][PreRank] scoring {} candidates — requestedCats={} budget={} format='{}'",
+            candidates.size(), requestedCats,
+            budget != null ? "$" + budget : "none",
+            format != null ? format : "any");
+
+        // ── Score every candidate, tracking which signals fired ────────────────
+        List<ScoredCandidate> scored = new ArrayList<>(candidates.size());
+        for (MediaItem item : candidates) {
+            double score = 0;
+            List<String> sigs = new ArrayList<>();
+
+            // Category match
+            if (item.getCategory() != null && requestedCats.contains(item.getCategory())) {
+                score += 30; sigs.add("+30_category");
+            } else if (item.getCategory() != null) {
+                sigs.add("0_category:" + item.getCategory());
+            } else {
+                sigs.add("0_no_category");
+            }
+
+            // Traffic tier
+            Long visits = item.getSimilarwebVisits();
+            if (visits != null) {
+                if      (visits >= 5_000_000) { score += 40; sigs.add("+40_traffic>5M"); }
+                else if (visits >= 1_000_000) { score += 30; sigs.add("+30_traffic>1M"); }
+                else if (visits >= 100_000)   { score += 20; sigs.add("+20_traffic>100K"); }
+                else                           { score += 10; sigs.add("+10_traffic<100K"); }
+            } else {
+                sigs.add("0_no_traffic");
+            }
+
+            // Enrichment
+            if (item.getDescription() != null && !item.getDescription().isBlank()) {
+                score += 20; sigs.add("+20_enriched");
+            } else {
+                sigs.add("0_unenriched");
+            }
+
+            // SEO
+            if (item.getAhrefsDr() != null) {
+                if (item.getAhrefsDr() >= 50) { score += 10; sigs.add("+10_DR=" + item.getAhrefsDr()); }
+                else                           { sigs.add("0_DR=" + item.getAhrefsDr()); }
+            }
+            if (item.getMozDa() != null && item.getMozDa() >= 40) {
+                score += 5; sigs.add("+5_DA=" + item.getMozDa());
+            }
+
+            // Budget
+            if (budget != null && item.getCostUsd() != null) {
+                double cost = item.getCostUsd().doubleValue();
+                if (cost <= budget)       { score += 10; sigs.add("+10_in_budget($" + (int) cost + ")"); }
+                else if (cost > budget * 3){ score -= 20; sigs.add("-20_3x_budget($" + (int) cost + ")"); }
+                else                       { sigs.add("0_over_budget($" + (int) cost + ")"); }
+            }
+
+            // Format
+            if (format != null && item.getFormatType() != null
+                    && item.getFormatType().equalsIgnoreCase(format)) {
+                score += 15; sigs.add("+15_format=" + item.getFormatType());
+            } else if (item.getFormatType() != null) {
+                sigs.add("0_format=" + item.getFormatType());
+            }
+
+            scored.add(new ScoredCandidate(item, score, sigs));
+        }
+
+        scored.sort(Comparator.comparingDouble(ScoredCandidate::score).reversed());
+
+        List<MediaItem> trimmed = scored.stream().limit(maxItems).map(ScoredCandidate::item).toList();
+
+        double maxScore = scored.get(0).score();
+        double minScore = scored.get(scored.size() - 1).score();
+        double cutScore = scored.size() > maxItems ? scored.get(maxItems - 1).score() : minScore;
+        long   dropped  = scored.size() - maxItems;
+
+        log.info("[RecEngine][PreRank] pool={} → batch={} dropped={} scores: max={} cut={} min={}",
+            candidates.size(), trimmed.size(), dropped,
+            String.format("%.0f", maxScore),
+            String.format("%.0f", cutScore),
+            String.format("%.0f", minScore));
+
+        // Log all items at DEBUG
+        log.debug("[RecEngine][PreRank] full ranked list ({} items):", scored.size());
+        for (int i = 0; i < scored.size(); i++) {
+            ScoredCandidate sc = scored.get(i);
+            log.debug("[PreRank] #{} score={} {} signals={} title='{}'",
+                i + 1,
+                String.format("%.0f", sc.score()),
+                i < maxItems ? "KEPT  " : "DROPPED",
+                sc.signals(),
+                sc.item().getTitle());
+        }
+
+        // ── Debug event — ALL scored items with full breakdown ─────────────────
+        List<Map<String, Object>> allItems = new ArrayList<>(scored.size());
+        for (int i = 0; i < scored.size(); i++) {
+            ScoredCandidate sc = scored.get(i);
+            MediaItem       it = sc.item();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("rank",    i + 1);
+            m.put("kept",    i < maxItems);
+            m.put("score",   (int) sc.score());
+            m.put("signals", sc.signals());
+            m.put("title",   it.getTitle());
+            if (it.getCategory() != null) m.put("category", it.getCategory());
+            if (it.getFormatType() != null) m.put("format", it.getFormatType());
+            if (it.getSimilarwebVisits() != null) {
+                long v = it.getSimilarwebVisits();
+                m.put("traffic", v >= 1_000_000 ? String.format("%.1fM", v / 1_000_000.0)
+                    : v >= 1_000 ? String.format("%.0fK", v / 1_000.0) : String.valueOf(v));
+            }
+            if (it.getCostUsd() != null) m.put("cost_usd", it.getCostUsd());
+            if (it.getAhrefsDr() != null) m.put("dr", it.getAhrefsDr());
+            m.put("enriched", it.getDescription() != null && !it.getDescription().isBlank());
+            allItems.add(m);
+        }
+
+        // Category distribution in kept vs dropped
+        Map<String, Long> keptByCategory = scored.stream().limit(maxItems)
+            .collect(Collectors.groupingBy(
+                sc -> sc.item().getCategory() != null ? sc.item().getCategory() : "—",
+                Collectors.counting()));
+        Map<String, Long> droppedByCategory = scored.stream().skip(maxItems)
+            .collect(Collectors.groupingBy(
+                sc -> sc.item().getCategory() != null ? sc.item().getCategory() : "—",
+                Collectors.counting()));
+
+        log.info("[RecEngine][PreRank] kept by category: {}", keptByCategory);
+        log.info("[RecEngine][PreRank] dropped by category: {}", droppedByCategory);
+
+        Map<String, Object> eventData = new LinkedHashMap<>();
+        eventData.put("pool_in",             candidates.size());
+        eventData.put("batch_out",           trimmed.size());
+        eventData.put("dropped",             dropped);
+        eventData.put("enrich_batch_size",   maxItems);
+        eventData.put("score_max",           (int) maxScore);
+        eventData.put("score_cut",           (int) cutScore);
+        eventData.put("score_min",           (int) minScore);
+        eventData.put("kept_by_category",    keptByCategory);
+        eventData.put("dropped_by_category", droppedByCategory);
+        eventData.put("all_scored",          allItems);  // full ranked list with signals
+
+        DebugEvents.emit(debug, sid, "search", "pre_rank",
+            "Pre-Rank: " + candidates.size() + " scored → " + trimmed.size() + " kept, " + dropped + " dropped",
+            eventData);
+
+        return trimmed;
     }
 
     // ── Keyword search with per-keyword tracing ─────────────────────────────────
