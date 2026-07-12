@@ -3,6 +3,8 @@ package com.advertising.service.enrichment;
 import com.advertising.model.dto.RecommendationRequestDTO;
 import com.advertising.model.dto.RecommendationResponseDTO;
 import com.advertising.model.entity.MediaItem;
+import com.advertising.model.websocket.WebSocketMessage;
+import com.advertising.service.debug.DebugEvents;
 import com.advertising.service.openai.OpenAIService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,6 +16,7 @@ import reactor.core.publisher.Mono;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.function.Consumer;
 
 /**
  * Takes raw SQL candidates and uses GPT to produce enriched recommendations
@@ -194,20 +197,35 @@ public class EnrichmentMechanismService {
 
     public Mono<RecommendationResponseDTO> enrich(
             List<MediaItem> rawCandidates,
-            RecommendationRequestDTO request) {
+            RecommendationRequestDTO request,
+            Consumer<WebSocketMessage> debug) {
+
+        String sid = request.getSessionId();
 
         if (rawCandidates.isEmpty()) {
-            log.warn("[Enrichment] no candidates for session={}", request.getSessionId());
+            log.warn("[Enrichment] no candidates for session={}", sid);
+            DebugEvents.emit(debug, sid, "enrichment", "no_candidates",
+                "No Candidates — returning empty result", Map.of());
             return Mono.just(RecommendationResponseDTO.builder()
-                .sessionId(request.getSessionId())
+                .sessionId(sid)
                 .recommendations(List.of())
                 .build());
         }
 
-        log.info("[Enrichment] enriching {} candidates for session={}",
-            rawCandidates.size(), request.getSessionId());
+        log.info("[Enrichment] enriching {} candidates for session={}", rawCandidates.size(), sid);
 
-        // Compute event date context once — reused for all outlets in prompt building
+        // Emit what we're sending to the scoring LLM
+        Map<String, Object> inputData = new LinkedHashMap<>();
+        inputData.put("candidate_count", rawCandidates.size());
+        inputData.put("categories", request.getCategories() != null ? request.getCategories() : List.of());
+        if (request.getBudgetUsd() != null) inputData.put("budget_usd", request.getBudgetUsd());
+        if (request.getTargetAudienceDescription() != null) inputData.put("audience", request.getTargetAudienceDescription());
+        if (request.getFormatPreference() != null) inputData.put("format_preference", request.getFormatPreference());
+        if (request.getRegion() != null) inputData.put("region", request.getRegion());
+        inputData.put("candidate_titles", rawCandidates.stream().map(MediaItem::getTitle).toList());
+        DebugEvents.emit(debug, sid, "enrichment", "llm_input",
+            "Scoring LLM Input (" + rawCandidates.size() + " candidates)", inputData);
+
         EventDateContext eventCtx = parseEventDate(request.getEventDate());
 
         List<Map<String, String>> messages = List.of(
@@ -216,11 +234,48 @@ public class EnrichmentMechanismService {
         );
 
         return openAIService.chatCompletionStructured(messages, "enrichment_response", enrichmentSchema)
-            .map(json -> buildResponse(json, rawCandidates, request.getSessionId()))
+            .doOnNext(json -> {
+                // Emit scoring results before mapping to DTO
+                String reasoning = json.path("reasoning").asText("");
+                List<Map<String, Object>> scores = new ArrayList<>();
+                json.path("recommendations").forEach(rec -> {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("id", rec.path("media_item_id").asText(""));
+                    entry.put("score", rec.path("match_score").asInt(0));
+                    entry.put("format", rec.path("suggested_format").asText(""));
+                    entry.put("reason", rec.path("match_reason").asText(""));
+                    // Attach title from candidate list
+                    String idStr = rec.path("media_item_id").asText(null);
+                    if (idStr != null) {
+                        rawCandidates.stream()
+                            .filter(m -> m.getId().toString().equals(idStr))
+                            .findFirst()
+                            .ifPresent(m -> entry.put("title", m.getTitle()));
+                    }
+                    scores.add(entry);
+                });
+                Map<String, Object> outputData = new LinkedHashMap<>();
+                outputData.put("reasoning", reasoning);
+                outputData.put("returned_count", scores.size());
+                outputData.put("scores", scores);
+                DebugEvents.emit(debug, sid, "enrichment", "llm_output",
+                    "Scoring LLM Output (" + scores.size() + " recommendations)", outputData);
+            })
+            .map(json -> buildResponse(json, rawCandidates, sid))
             .doOnNext(resp -> log.info("[Enrichment] {} recommendations for session={}",
-                resp.getRecommendations().size(), request.getSessionId()))
-            .doOnError(e -> log.error("[Enrichment] LLM failed: {}", e.getMessage(), e))
-            .onErrorReturn(buildFallbackResponse(rawCandidates, request.getSessionId()));
+                resp.getRecommendations().size(), sid))
+            .doOnError(e -> {
+                log.error("[Enrichment] LLM failed: {}", e.getMessage(), e);
+                DebugEvents.emit(debug, sid, "enrichment", "llm_error",
+                    "Scoring LLM Error — using fallback", Map.of("error", e.getMessage()));
+            })
+            .onErrorReturn(buildFallbackResponse(rawCandidates, sid));
+    }
+
+    public Mono<RecommendationResponseDTO> enrich(
+            List<MediaItem> rawCandidates,
+            RecommendationRequestDTO request) {
+        return enrich(rawCandidates, request, DebugEvents.NOOP);
     }
 
     // ── Prompt building ─────────────────────────────────────────────────────────

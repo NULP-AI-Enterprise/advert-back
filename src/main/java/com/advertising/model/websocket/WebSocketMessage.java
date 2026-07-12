@@ -38,6 +38,9 @@ public class WebSocketMessage {
         MARKETING_PLAN_READY,
         ERROR,
         PING,
-        PONG
+        PONG,
+
+        // Debug tracing (server → client, not persisted)
+        DEBUG_EVENT
     }
 }

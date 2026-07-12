@@ -7,6 +7,7 @@ import com.advertising.model.entity.ChatSession;
 import com.advertising.model.websocket.WebSocketMessage;
 import com.advertising.repository.ChatMessageRepository;
 import com.advertising.repository.ChatSessionRepository;
+import com.advertising.service.debug.DebugEvents;
 import com.advertising.service.enrichment.EnrichmentMechanismService;
 import com.advertising.service.openai.AgenticLoopService;
 import com.advertising.service.openai.OpenAIService;
@@ -19,6 +20,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
@@ -49,6 +51,11 @@ public class ChatService {
     public Flux<WebSocketMessage> processMessage(String sessionId, String userContent, Object rawPayload) {
         log.info("[Chat] processMessage session={}", sessionId);
 
+        // Per-request debug sink — buffers events until the subscriber (WebSocket handler) drains them
+        Sinks.Many<WebSocketMessage> debugSink = Sinks.many().unicast().onBackpressureBuffer();
+        var debug = (java.util.function.Consumer<WebSocketMessage>)
+            msg -> debugSink.tryEmitNext(msg);
+
         // Extract device context from payload
         String deviceLocation = null;
         String deviceLanguage = null;
@@ -76,15 +83,19 @@ public class ChatService {
         // Load previous recommendation context from Redis
         String previousContext = loadPreviousContext(sessionId);
 
-        return Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.user, userContent))
+        Flux<WebSocketMessage> mainFlux = Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.user, userContent))
             .subscribeOn(Schedulers.boundedElastic())
             .then(Mono.fromRunnable(() -> chatHistoryService.invalidateCache(sessionId))
                 .subscribeOn(Schedulers.boundedElastic()))
             .thenMany(
-                agenticLoopService.decide(sessionId, userContent, finalDeviceLocation, finalDeviceLanguage, previousContext)
-                    .flatMapMany(decision -> handleDecision(sessionId, decision))
+                agenticLoopService.decide(sessionId, userContent, finalDeviceLocation, finalDeviceLanguage,
+                        previousContext, debug)
+                    .flatMapMany(decision -> handleDecision(sessionId, decision, debug))
             )
-            .doOnError(e -> log.error("[Chat] pipeline error: {}", e.getMessage(), e));
+            .doOnError(e -> log.error("[Chat] pipeline error: {}", e.getMessage(), e))
+            .doFinally(signal -> debugSink.tryEmitComplete());
+
+        return Flux.merge(debugSink.asFlux(), mainFlux);
     }
 
     // Backward-compatible overload
@@ -92,7 +103,8 @@ public class ChatService {
         return processMessage(sessionId, userContent, null);
     }
 
-    private Flux<WebSocketMessage> handleDecision(String sessionId, AgenticLoopService.AgentDecision decision) {
+    private Flux<WebSocketMessage> handleDecision(String sessionId, AgenticLoopService.AgentDecision decision,
+                                                   java.util.function.Consumer<WebSocketMessage> debug) {
         log.info("[Chat] decision={}", decision.getClass().getSimpleName());
 
         if (decision instanceof AgenticLoopService.AgentDecision.Clarify c) {
@@ -113,8 +125,8 @@ public class ChatService {
         AgenticLoopService.AgentDecision.Search s = (AgenticLoopService.AgentDecision.Search) decision;
         log.info("[Chat] search categories={} region={}", s.request().getCategories(), s.request().getRegion());
 
-        return recEngineService.findCandidates(s.request())
-            .flatMap(candidates -> enrichmentMechanismService.enrich(candidates, s.request()))
+        return recEngineService.findCandidates(s.request(), debug)
+            .flatMap(candidates -> enrichmentMechanismService.enrich(candidates, s.request(), debug))
             .flatMapMany(recs -> {
                 // Save context to Redis for next query and marketing plan
                 saveRecommendationContext(sessionId, recs, s.request());

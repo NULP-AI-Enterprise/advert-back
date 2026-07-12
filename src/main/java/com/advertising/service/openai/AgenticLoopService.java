@@ -2,7 +2,9 @@ package com.advertising.service.openai;
 
 import com.advertising.model.dto.RecommendationRequestDTO;
 import com.advertising.model.entity.ChatMessage;
+import com.advertising.model.websocket.WebSocketMessage;
 import com.advertising.service.chat.ChatHistoryService;
+import com.advertising.service.debug.DebugEvents;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -12,8 +14,10 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -245,28 +249,82 @@ public class AgenticLoopService {
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage,
                                       String deviceLocation, String deviceLanguage,
-                                      String previousContext) {
+                                      String previousContext,
+                                      Consumer<WebSocketMessage> debug) {
         log.info("[Agentic] decide() session={}", sessionId);
         return chatHistoryService.getRecentHistory(sessionId, contextWindow)
             .flatMap(history -> {
                 long clarifyCount = history.stream()
                     .filter(m -> "assistant".equalsIgnoreCase(m.getRole().name()))
                     .count();
+                boolean resultsShown = previousContext != null && !previousContext.isBlank();
                 log.info("[Agentic] history={} msgs, clarifyCount={}, calling OpenAI", history.size(), clarifyCount);
+
+                // Debug: what we're sending to the router LLM
+                Map<String, Object> inputData = new LinkedHashMap<>();
+                inputData.put("history_msgs", history.size());
+                inputData.put("clarify_count", clarifyCount);
+                inputData.put("results_shown", resultsShown);
+                inputData.put("user_message", userMessage);
+                if (deviceLanguage != null) inputData.put("device_language", deviceLanguage);
+                if (deviceLocation != null) inputData.put("device_location", deviceLocation);
+                if (resultsShown) inputData.put("active_params_preview",
+                    previousContext.lines().limit(5).collect(Collectors.joining("\n")));
+                DebugEvents.emit(debug, sessionId, "router", "llm_input",
+                    "Router → LLM (preparing request)", inputData);
+
                 List<Map<String, String>> messages = buildMessageList(
                     history, userMessage, deviceLocation, deviceLanguage, previousContext, clarifyCount);
                 return openAIService.chatCompletionStructured(messages, "router_response", routerSchema);
             })
             .map(json -> {
                 String reasoning = json.path("reasoning").asText("");
+                String action    = json.path("action").asText("clarify");
                 if (!reasoning.isBlank()) log.info("[Agentic] reasoning: {}", reasoning);
+
+                // Debug: what the router LLM decided
+                Map<String, Object> outputData = new LinkedHashMap<>();
+                outputData.put("action", action);
+                outputData.put("reasoning", reasoning);
+                if ("clarify".equals(action)) {
+                    outputData.put("question", json.path("question").asText(""));
+                }
+                if ("search".equals(action) && !json.path("search_params").isNull()) {
+                    JsonNode sp = json.path("search_params");
+                    Map<String, Object> params = new LinkedHashMap<>();
+                    if (sp.has("categories"))  params.put("categories", sp.path("categories").toString());
+                    if (sp.has("keywords"))     params.put("keywords", sp.path("keywords").toString());
+                    if (!sp.path("region").isNull()) params.put("region", sp.path("region").asText());
+                    if (!sp.path("country").isNull()) params.put("country", sp.path("country").asText());
+                    if (!sp.path("budget_usd").isNull()) params.put("budget_usd", sp.path("budget_usd").asText());
+                    if (!sp.path("format_preference").isNull()) params.put("format", sp.path("format_preference").asText());
+                    if (sp.has("max_results")) params.put("max_results", sp.path("max_results").asInt());
+                    outputData.put("search_params", params);
+                }
+                List<String> sugg = new ArrayList<>();
+                json.path("suggestions").forEach(n -> sugg.add(n.asText()));
+                if (!sugg.isEmpty()) outputData.put("suggestions", sugg);
+
+                DebugEvents.emit(debug, sessionId, "router", "llm_output",
+                    "LLM Decision: " + action.toUpperCase(), outputData);
+
                 return parseDecision(json, sessionId);
             })
-            .doOnError(e -> log.error("[Agentic] OpenAI call failed: {}", e.getMessage(), e));
+            .doOnError(e -> {
+                log.error("[Agentic] OpenAI call failed: {}", e.getMessage(), e);
+                DebugEvents.emit(debug, sessionId, "router", "llm_error",
+                    "Router LLM Error", Map.of("error", e.getMessage()));
+            });
+    }
+
+    public Mono<AgentDecision> decide(String sessionId, String userMessage,
+                                      String deviceLocation, String deviceLanguage,
+                                      String previousContext) {
+        return decide(sessionId, userMessage, deviceLocation, deviceLanguage, previousContext, DebugEvents.NOOP);
     }
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage) {
-        return decide(sessionId, userMessage, null, null, null);
+        return decide(sessionId, userMessage, null, null, null, DebugEvents.NOOP);
     }
 
     // ── Internal ────────────────────────────────────────────────────────────────
