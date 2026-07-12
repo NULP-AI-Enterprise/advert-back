@@ -74,13 +74,13 @@ CREATE TABLE IF NOT EXISTS media_items (
     -- Vector embedding (managed by enricher, @Transient in Hibernate)
     embedding   vector(1536),
 
-    -- Full-text search vector (auto-computed from title + description + category + tags)
+    -- Full-text search vector (auto-computed from title + description + category)
+    -- tags excluded: array_to_string() is STABLE not IMMUTABLE, forbidden in generated columns
     search_vector tsvector GENERATED ALWAYS AS (
         to_tsvector('simple',
             coalesce(title, '') || ' ' ||
             coalesce(description, '') || ' ' ||
-            coalesce(category, '') || ' ' ||
-            coalesce(array_to_string(tags, ' '), '')
+            coalesce(category, '')
         )
     ) STORED,
 

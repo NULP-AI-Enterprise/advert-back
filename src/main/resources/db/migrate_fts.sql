@@ -16,8 +16,7 @@ ALTER TABLE media_items
             to_tsvector('simple',
                 coalesce(title, '') || ' ' ||
                 coalesce(description, '') || ' ' ||
-                coalesce(category, '') || ' ' ||
-                coalesce(array_to_string(tags, ' '), '')
+                coalesce(category, '')
             )
         ) STORED;
 
