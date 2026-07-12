@@ -244,17 +244,15 @@ public class EnrichmentMechanismService {
 
         return openAIService.chatCompletionStructured(messages, "enrichment_response", enrichmentSchema)
             .doOnNext(json -> {
-                // Emit scoring results before mapping to DTO
                 String reasoning = json.path("reasoning").asText("");
                 List<Map<String, Object>> scores = new ArrayList<>();
                 json.path("recommendations").forEach(rec -> {
                     Map<String, Object> entry = new LinkedHashMap<>();
-                    entry.put("id", rec.path("media_item_id").asText(""));
+                    String idStr = rec.path("media_item_id").asText(null);
+                    entry.put("id", idStr != null ? idStr : "");
                     entry.put("score", rec.path("match_score").asInt(0));
                     entry.put("format", rec.path("suggested_format").asText(""));
                     entry.put("reason", rec.path("match_reason").asText(""));
-                    // Attach title from candidate list
-                    String idStr = rec.path("media_item_id").asText(null);
                     if (idStr != null) {
                         rawCandidates.stream()
                             .filter(m -> m.getId().toString().equals(idStr))
@@ -263,15 +261,41 @@ public class EnrichmentMechanismService {
                     }
                     scores.add(entry);
                 });
+
+                // Score distribution — how many in each tier
+                long excellent = scores.stream().filter(s -> (Integer) s.get("score") >= 80).count();
+                long good      = scores.stream().filter(s -> { int sc = (Integer) s.get("score"); return sc >= 60 && sc < 80; }).count();
+                long partial   = scores.stream().filter(s -> { int sc = (Integer) s.get("score"); return sc >= 30 && sc < 60; }).count();
+                int excluded   = rawCandidates.size() - scores.size();
+
+                log.info("[Enrichment] ← LLM returned {} recommendations from {} candidates " +
+                    "(excellent≥80: {} good≥60: {} partial≥30: {} excluded<30: {})",
+                    scores.size(), rawCandidates.size(), excellent, good, partial, excluded);
+                log.info("[Enrichment] reasoning: '{}'",
+                    reasoning.length() > 300 ? reasoning.substring(0, 300) + "…" : reasoning);
+
+                // Log each scored item
+                scores.forEach(s -> log.info("[Enrichment] score={} title='{}' format='{}' reason_preview='{}'",
+                    s.get("score"),
+                    s.getOrDefault("title", s.get("id")),
+                    s.get("format"),
+                    s.get("reason") instanceof String r
+                        ? (r.length() > 120 ? r.substring(0, 120) + "…" : r)
+                        : ""));
+
                 Map<String, Object> outputData = new LinkedHashMap<>();
                 outputData.put("reasoning", reasoning);
+                outputData.put("candidates_in", rawCandidates.size());
                 outputData.put("returned_count", scores.size());
+                outputData.put("excluded_count", excluded);
+                outputData.put("score_distribution",
+                    Map.of("excellent_80plus", excellent, "good_60_79", good, "partial_30_59", partial));
                 outputData.put("scores", scores);
                 DebugEvents.emit(debug, sid, "enrichment", "llm_output",
-                    "Scoring LLM Output (" + scores.size() + " recommendations)", outputData);
+                    "Scoring LLM Output (" + scores.size() + " of " + rawCandidates.size() + " kept)", outputData);
             })
             .map(json -> buildResponse(json, rawCandidates, sid))
-            .doOnNext(resp -> log.info("[Enrichment] {} recommendations for session={}",
+            .doOnNext(resp -> log.info("[Enrichment] DONE: {} final recommendations returned session={}",
                 resp.getRecommendations().size(), sid))
             .doOnError(e -> {
                 log.error("[Enrichment] LLM failed: {}", e.getMessage(), e);

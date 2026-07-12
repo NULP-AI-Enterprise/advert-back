@@ -23,6 +23,8 @@ spring:
       maximum-pool-size: 20
       minimum-idle: 5
       connection-timeout: 30000
+      # Scan 20 of 100 ivfflat lists (~780 items) instead of the default 1 (~39 items)
+      connection-init-sql: "SET ivfflat.probes = 20"
 
   jpa:
     hibernate:

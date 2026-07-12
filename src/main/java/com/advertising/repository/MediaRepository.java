@@ -133,4 +133,18 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
         @Param("category") String category,
         Pageable pageable
     );
+
+    // ── Catalog stats — used by RecEngineService for startup diagnostics ────────
+
+    @Query(value = "SELECT COUNT(*) FROM media_items", nativeQuery = true)
+    long countAll();
+
+    @Query(value = "SELECT COUNT(*) FROM media_items WHERE embedding IS NOT NULL", nativeQuery = true)
+    long countWithEmbedding();
+
+    @Query(value = "SELECT COUNT(*) FROM media_items WHERE description IS NOT NULL AND description != ''", nativeQuery = true)
+    long countEnriched();
+
+    @Query(value = "SELECT COUNT(DISTINCT category) FROM media_items WHERE category IS NOT NULL", nativeQuery = true)
+    long countDistinctCategories();
 }
