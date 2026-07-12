@@ -152,8 +152,8 @@ public class ChatService {
 
                 List<Map<String, String>> messages = List.of(
                     Map.of("role", "system", "content", """
-                        You are a pragmatic, data-driven media planning strategist with deep knowledge
-                        of the Ukrainian media market. Your goal is to synthesize raw media placements
+                        You are a pragmatic, data-driven media planning strategist with global expertise
+                        across all markets. Your goal is to synthesize raw media placements
                         into a cohesive, actionable marketing plan — not a generic one.
 
                         Rules:
@@ -161,7 +161,8 @@ public class ChatService {
                         - Prioritise high-traffic outlets with strong audience alignment.
                         - Suggest the format that best serves the campaign objective for each outlet.
                         - The `notes` field must contain ONE concrete, non-obvious strategic tip
-                          (e.g. "Publish on Tuesday morning — Ukrainian tech audiences peak 9-11am").
+                          specific to this market and audience (e.g. day-of-week timing, seasonal
+                          patterns, audience behaviour peculiarities for this country/sector).
                         - Return ONLY valid JSON, no markdown, no prose outside the JSON object.
 
                         Output schema (strict):

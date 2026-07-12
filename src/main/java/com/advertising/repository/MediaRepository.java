@@ -30,26 +30,42 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
         @Param("limit") int limit
     );
 
+    /** Same as findSimilarByEmbedding but pre-filters by format_type when non-empty. */
     @Query(value = """
-        SELECT CAST(id AS text), 0.5 AS similarity
+        SELECT CAST(id AS text), 1 - (embedding <=> CAST(:embedding AS vector)) AS similarity
+        FROM media_items
+        WHERE embedding IS NOT NULL
+          AND 1 - (embedding <=> CAST(:embedding AS vector)) >= :threshold
+          AND (:format = '' OR LOWER(format_type) = LOWER(:format))
+        ORDER BY embedding <=> CAST(:embedding AS vector)
+        LIMIT :limit
+        """, nativeQuery = true)
+    List<Object[]> findSimilarByEmbeddingFiltered(
+        @Param("embedding") String embeddingJson,
+        @Param("threshold") double threshold,
+        @Param("limit") int limit,
+        @Param("format") String format
+    );
+
+    @Query(value = """
+        SELECT CAST(id AS text),
+               CASE WHEN :query = '' THEN 0.5
+                    ELSE ts_rank(search_vector, websearch_to_tsquery('simple', :query))
+               END AS similarity
         FROM media_items
         WHERE (
               :query = ''
-           OR LOWER(title)       LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(url)         LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(description) LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(category)    LIKE LOWER(CONCAT('%', :query, '%'))
-           OR LOWER(format_type) LIKE LOWER(CONCAT('%', :query, '%'))
-           OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :query, '%')))
+           OR search_vector @@ websearch_to_tsquery('simple', :query)
+           OR LOWER(url) LIKE LOWER(CONCAT('%', :query, '%'))
         )
         AND (
               :region = ''
            OR LOWER(country)               LIKE LOWER(CONCAT('%', :region, '%'))
            OR LOWER(CAST(audience AS text)) LIKE LOWER(CONCAT('%', :region, '%'))
            OR LOWER(CAST(metrics  AS text)) LIKE LOWER(CONCAT('%', :region, '%'))
-           OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) LIKE LOWER(CONCAT('%', :region, '%')))
         )
-        ORDER BY COALESCE(similarweb_visits, 0) DESC
+        ORDER BY COALESCE(similarweb_visits, 0) DESC,
+                 ts_rank(search_vector, websearch_to_tsquery('simple', NULLIF(:query, ''))) DESC NULLS LAST
         LIMIT :limit
         """, nativeQuery = true)
     List<Object[]> findByTextAndRegion(
@@ -85,11 +101,15 @@ public interface MediaRepository extends JpaRepository<MediaItem, UUID> {
      * smart padding in RecEngineService before falling back to top-traffic.
      * Ordered by traffic DESC so best outlets come first.
      */
+    /** Finds outlets by exact category match OR FTS match on category term. */
     @Query(value = """
         SELECT CAST(id AS text), 0.4 AS similarity
         FROM media_items
         WHERE category = :category
-        ORDER BY COALESCE(similarweb_visits, 0) DESC
+           OR search_vector @@ websearch_to_tsquery('simple', :category)
+        ORDER BY
+            CASE WHEN category = :category THEN 1 ELSE 2 END,
+            COALESCE(similarweb_visits, 0) DESC
         LIMIT :limit
         """, nativeQuery = true)
     List<Object[]> findByCategory(

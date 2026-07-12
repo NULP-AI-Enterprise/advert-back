@@ -114,8 +114,10 @@ public class AgenticLoopService {
         REPEAT SIGNAL: If the user says "already provided", "I told you", "you already asked",
         or similar — look through the full conversation history to extract the answer.
 
-        BUDGET CURRENCY: Accept any format: "500 eur", "€500", "10000 грн", "$2000", "2k usd".
-        Convert to USD (1 EUR ≈ 1.1 USD, 1 UAH ≈ 0.024 USD). Indifference expressions → null.
+        BUDGET CURRENCY: Accept any format: "500 eur", "€500", "$2000", "2k usd", "£1500",
+        "10000 грн", "5000 zł", "50000 ₹", "200000 ¥".
+        Convert to USD using approximate current exchange rates (use your knowledge of current rates
+        for any currency). Indifference expressions → null.
 
         MAX CLARIFY: You have been given CURRENT_CLARIFY_COUNT and RESULTS_SHOWN.
         - If RESULTS_SHOWN=false AND CURRENT_CLARIFY_COUNT >= 3 → set action="search" immediately.
@@ -147,7 +149,7 @@ public class AgenticLoopService {
           Ask ONE specific question that would most improve the results, e.g.:
           "Are you targeting hiring (job candidates) or sales (B2B clients)?",
           "What specific services do you offer — web dev, mobile apps, AI?",
-          "Any preferred regions or Ukrainian-only media?"
+          "Any preferred regions or local-only media?"
 
         ═══ REASONING STEPS ═══
 
@@ -174,7 +176,7 @@ public class AgenticLoopService {
           "Show only national-reach media"
           "Focus on Technology category only"
           "Set budget to $500"
-          "Search in Kyiv region instead"
+          "Search in a different region"
           "Increase to 15 results"
           "Create marketing plan"
         Never suggest vague advice like "Explore creative strategies".
@@ -182,12 +184,13 @@ public class AgenticLoopService {
         ═══ CATEGORY CLASSIFICATION ═══
 
         Canonical values only:
-        News | Business | Technology | Sports | Fashion | Agriculture | Video | Entertainment | Science | Politics
+        News | Business | Technology | Sports | Fashion | Agriculture | Video | Entertainment | Science | Health | Politics
 
         Map broadly:
           fintech/crypto/blockchain/web3/SaaS/AI/drones/hardware → Technology
           finance/investment/insurance/real estate/B2B           → Business
-          health/medicine/biotech                                 → Science
+          health/medicine/pharma/wellness/fitness/medical        → Health
+          biotech/life-sciences                                   → Science
           politics/government/NGO                                 → Politics
         Return up to 3 best-matching categories.
 
@@ -220,6 +223,22 @@ public class AgenticLoopService {
         ═══ GEO ═══
 
         region: most specific location (city/district). country: the country. Both nullable.
+
+        ═══ LANGUAGE DETECTION ═══
+
+        If the user writes in a non-English language AND no country has been explicitly set,
+        infer the most likely country as a soft default:
+          Ukrainian Cyrillic (letters і, ї, є, щ or words "для", "або", "що", "це", "та") → "Ukraine"
+          Russian Cyrillic (ё, ъ, ы dominant, no і/ї/є) → "Russia"
+          French → "France"
+          German → "Germany"
+          Spanish → "Spain" (if Latin American terms appear, ask to clarify)
+          Polish → "Poland"
+          Turkish → "Turkey"
+          Arabic → ask to clarify (many countries share Arabic)
+          Other languages → use your knowledge to infer the most likely country
+        Always a soft inference — override immediately if the user specifies otherwise.
+        Never ask the user to confirm their country when language inference is sufficient.
         """;
 
     // ── Public API ─────────────────────────────────────────────────────────────

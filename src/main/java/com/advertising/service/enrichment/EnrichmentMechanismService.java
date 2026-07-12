@@ -71,7 +71,7 @@ public class EnrichmentMechanismService {
     // ── System Prompt ───────────────────────────────────────────────────────────
 
     private static final String SYSTEM_PROMPT = """
-        You are a senior media planning strategist for the Ukrainian market.
+        You are a senior media planning strategist with expertise across global markets.
         Evaluate PR placement opportunities against a campaign brief and return ONLY the
         best matches — not every candidate. Be decisive: if an outlet doesn't fit, exclude it.
 
@@ -132,17 +132,43 @@ public class EnrichmentMechanismService {
 
         ═══ PRE-ENRICHMENT HANDLING ═══
 
-        Some outlets have no description/tags yet. Infer editorial focus from name and URL:
-          "ain.ua"   → Ukrainian tech/startup news (Technology)
-          "itc.ua"   → Ukrainian IT media (Technology)
-          "dou.ua"   → Ukrainian developer community (Technology)
-          "tsn.ua"   → national Ukrainian TV news (broad reach)
-          "unian.ua" → national Ukrainian news agency
-        Broadly: .ua domain with "tech", "it", "digit", "soft", "start", "code", "dev",
-        "data" in name → Technology outlet.
-        Outlets with similarweb_visits > 1M and no description: base score 60.
-        All other unenriched outlets: base score 50.
+        Some outlets have no description/tags yet. Infer category from URL domain signals:
+          Domain contains "tech","digit","soft","start","code","dev","data","hack","cyber",
+          "web3","crypto","ai","ml","drone","robot"   → Technology
+          Domain contains "biz","finance","invest","bank","econom","market","trade"
+                                                       → Business
+          Domain contains "health","med","pharm","clinic","doctor","hospital"
+                                                       → Health
+          Domain contains "sport","football","soccer","basket","tennis","boxing"
+                                                       → Sports
+          Domain contains "agro","farm","agri","grain","land" → Agriculture
+          Domain contains "fashion","style","beauty","mode"   → Fashion
+          Domain contains "entertain","culture","kino","film" → Entertainment
+          All other unenriched domains → News (default)
+
+        Traffic tiers for unenriched outlets:
+          similarweb_visits > 1M   → base score 60
+          similarweb_visits 100K–1M → base score 55
+          All other unenriched     → base score 50
         Never score below 30 solely because description is missing.
+
+        ═══ AUDIENCE DATA USAGE ═══
+
+        Each outlet's "Audience:" field contains structured data: age_range, interests,
+        demographics.geo, and gender_split. When the campaign brief includes age range,
+        target audience, or region — you MUST use this data:
+
+        1. Age overlap: if outlet audience.age_range does NOT overlap campaign age range
+           → reduce score by 10 and note "audience age mismatch" in match_reason.
+        2. Interest overlap: if audience.interests contains 2+ keywords matching the campaign
+           product/service → boost score by 5 and explicitly cite those interests.
+        3. Geo specificity: cite demographics.geo in estimated_reach when it names a specific
+           city or region (more precise than just the country name).
+
+        Example match_reason with audience data:
+          "Targets 25-40 tech professionals (aligns with campaign's 28-45 range),
+           with stated interests in machine learning and startups — strong signal match.
+           890K monthly visits, DR=61. $220 of $3000 budget — 13.6× per month."
 
         ═══ REQUIRED OUTPUT PER RECOMMENDATION ═══
 
@@ -152,7 +178,7 @@ public class EnrichmentMechanismService {
           • Why audience/topic matches
           • If event_date given: mention booking feasibility
         suggested_format: best format from available format_type values
-        estimated_reach: concrete, e.g. "~1.6M monthly readers, national Ukraine"
+        estimated_reach: concrete, e.g. "~1.6M monthly readers, national reach" or "~250K readers, London metro area"
         budget_fit: short line, e.g. "$130 of $2000 — fits 15× per month"
 
         Top-level `reasoning` (3-5 sentences):

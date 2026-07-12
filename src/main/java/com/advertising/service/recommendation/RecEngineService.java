@@ -58,7 +58,7 @@ public class RecEngineService {
 
     private List<MediaItem> sqlQuery(RecommendationRequestDTO request, String embeddingJson) {
         int targetLimit = request.getMaxResults() > 0 ? request.getMaxResults() : 10;
-        int fetchLimit  = Math.min(targetLimit * 3, 30);
+        int fetchLimit  = Math.max(targetLimit * 4, 40);
 
         List<String> keywords = buildKeywords(request);
         log.info("[RecEngine] keywords={} region='{}' country='{}' fetchLimit={}",
@@ -69,17 +69,31 @@ public class RecEngineService {
         LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
         Set<String> seenKeys = new HashSet<>();
 
-        // ── Level 1: keyword × city/region ────────────────────────────────────
-        searchByKeywords(keywords, request.getRegion(), fetchLimit, pool, seenKeys);
-
-        // ── Level 1.5: vector similarity search (enriched items only) ─────────
+        // ── Level 1: vector similarity search (semantic, enriched items only) ──
         if (!embeddingJson.isBlank()) {
-            resolveItems(mediaRepository.findSimilarByEmbedding(embeddingJson, VECTOR_THRESHOLD, fetchLimit))
+            // Apply format pre-filter at SQL level when user specified a preference
+            String formatFilter = request.getFormatPreference() != null
+                ? request.getFormatPreference() : "";
+            resolveItems(mediaRepository.findSimilarByEmbeddingFiltered(
+                    embeddingJson, VECTOR_THRESHOLD, fetchLimit, formatFilter))
                 .forEach(item -> addToPool(item, pool, seenKeys));
-            if (!pool.isEmpty()) log.info("[RecEngine] after vector search → pool={}", pool.size());
+            log.info("[RecEngine] after vector search (threshold={}, format='{}') → pool={}",
+                VECTOR_THRESHOLD, formatFilter.isEmpty() ? "any" : formatFilter, pool.size());
+
+            // Retry at lower threshold when results are sparse
+            if (pool.size() < targetLimit / 2) {
+                log.info("[RecEngine] sparse vector results, retrying at threshold=0.45");
+                resolveItems(mediaRepository.findSimilarByEmbeddingFiltered(
+                        embeddingJson, 0.45, fetchLimit, formatFilter))
+                    .forEach(item -> addToPool(item, pool, seenKeys));
+                log.info("[RecEngine] after low-threshold retry → pool={}", pool.size());
+            }
         }
 
-        // ── Level 2: keyword × country (if region gave too few) ───────────────
+        // ── Level 2: keyword × city/region ────────────────────────────────────
+        searchByKeywords(keywords, request.getRegion(), fetchLimit, pool, seenKeys);
+
+        // ── Level 3: keyword × country (if region gave too few) ──────────────
         if (pool.size() < targetLimit && request.getCountry() != null && !request.getCountry().isBlank()) {
             String country = request.getCountry();
             searchByKeywords(keywords, country, fetchLimit, pool, seenKeys);
@@ -89,7 +103,7 @@ public class RecEngineService {
             }
         }
 
-        // ── Level 3: keyword × no geo (if still thin) ─────────────────────────
+        // ── Level 4: keyword × no geo (if still thin) ─────────────────────────
         if (pool.size() < targetLimit) {
             searchByKeywords(keywords, "", fetchLimit, pool, seenKeys);
             if (!pool.isEmpty() && (request.getRegion() != null || request.getCountry() != null)) {

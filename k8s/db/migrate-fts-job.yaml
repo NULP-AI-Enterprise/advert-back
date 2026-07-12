@@ -1,0 +1,79 @@
+---
+# ArgoCD PreSync hook — runs BEFORE each sync, applies idempotent migrations.
+# Deleted automatically after success (HookSucceeded policy).
+# Safe to re-run: all SQL uses IF NOT EXISTS / DROP DEFAULT guards.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: advert-db-migrate-fts
+  namespace: advert-back
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: postgres:16-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: advert-db-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: advert-db-secret
+                  key: POSTGRES_USER
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: advert-db-secret
+                  key: POSTGRES_DB
+          command:
+            - psql
+            - -h
+            - advert-postgres.advert-back.svc.cluster.local
+            - -f
+            - /migrations/migrate_fts.sql
+          volumeMounts:
+            - name: migration-sql
+              mountPath: /migrations
+      volumes:
+        - name: migration-sql
+          configMap:
+            name: advert-db-migrate-fts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: advert-db-migrate-fts
+  namespace: advert-back
+data:
+  migrate_fts.sql: |
+    -- Migration: FTS + country default cleanup
+    -- All statements are idempotent — safe to re-run on every ArgoCD sync.
+
+    -- 1. Remove Ukraine-specific country default
+    ALTER TABLE media_items ALTER COLUMN country DROP DEFAULT;
+
+    -- 2. Add generated tsvector column (no-op if already exists)
+    ALTER TABLE media_items
+        ADD COLUMN IF NOT EXISTS search_vector tsvector
+            GENERATED ALWAYS AS (
+                to_tsvector('simple',
+                    coalesce(title, '') || ' ' ||
+                    coalesce(description, '') || ' ' ||
+                    coalesce(category, '') || ' ' ||
+                    coalesce(array_to_string(tags, ' '), '')
+                )
+            ) STORED;
+
+    -- 3. GIN index for fast full-text search
+    CREATE INDEX IF NOT EXISTS idx_media_items_search_vector
+        ON media_items USING GIN (search_vector);

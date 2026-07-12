@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS media_items (
     title       VARCHAR(500) NOT NULL,
     url         VARCHAR(500),
     marketplace_url VARCHAR(500),
-    country     VARCHAR(100) DEFAULT 'Ukraine',
+    country     VARCHAR(100),
 
     -- Placement specs (from PRNEW CSV)
     cost_usd               NUMERIC(10,2),
@@ -74,6 +74,16 @@ CREATE TABLE IF NOT EXISTS media_items (
     -- Vector embedding (managed by enricher, @Transient in Hibernate)
     embedding   vector(1536),
 
+    -- Full-text search vector (auto-computed from title + description + category + tags)
+    search_vector tsvector GENERATED ALWAYS AS (
+        to_tsvector('simple',
+            coalesce(title, '') || ' ' ||
+            coalesce(description, '') || ' ' ||
+            coalesce(category, '') || ' ' ||
+            coalesce(array_to_string(tags, ' '), '')
+        )
+    ) STORED,
+
     created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -92,3 +102,4 @@ CREATE INDEX IF NOT EXISTS idx_media_items_cost_usd      ON media_items(cost_usd
 CREATE INDEX IF NOT EXISTS idx_media_items_visits        ON media_items(similarweb_visits DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_media_items_ahrefs_dr     ON media_items(ahrefs_dr DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_media_items_embedding     ON media_items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_media_items_search_vector ON media_items USING GIN (search_vector);
