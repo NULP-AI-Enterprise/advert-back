@@ -31,13 +31,11 @@ public class RecEngineService {
                                                  Consumer<WebSocketMessage> debug) {
         String queryText = buildQueryText(request);
         DebugEvents.emit(debug, request.getSessionId(), "search", "embed_query",
-            "Embedding Query Text",
-            Map.of("query", queryText,
-                   "categories", request.getCategories() != null ? request.getCategories() : List.of(),
-                   "keywords",   request.getKeywords()   != null ? request.getKeywords()   : List.of(),
-                   "region",     request.getRegion()     != null ? request.getRegion()     : "",
-                   "country",    request.getCountry()    != null ? request.getCountry()    : "",
-                   "format",     request.getFormatPreference() != null ? request.getFormatPreference() : "",
+            "Embedding Query → OpenAI",
+            Map.of("query_text",  queryText,
+                   "region",      request.getRegion()  != null ? request.getRegion()  : "any",
+                   "country",     request.getCountry() != null ? request.getCountry() : "any",
+                   "format",      request.getFormatPreference() != null ? request.getFormatPreference() : "any",
                    "max_results", request.getMaxResults()));
 
         return openAIService.createEmbedding(queryText)
@@ -82,9 +80,21 @@ public class RecEngineService {
         int fetchLimit  = Math.max(targetLimit * 4, 40);
         String sid      = request.getSessionId();
 
-        List<String> keywords = buildKeywords(request);
+        // ── Build keyword list with source breakdown ───────────────────────────
+        KeywordsResult kwr = buildKeywordsDetailed(request);
         log.info("[RecEngine] keywords={} region='{}' country='{}' fetchLimit={}",
-            keywords, request.getRegion(), request.getCountry(), fetchLimit);
+            kwr.all(), request.getRegion(), request.getCountry(), fetchLimit);
+
+        Map<String, Object> kwDebug = new LinkedHashMap<>();
+        kwDebug.put("final_keyword_list", kwr.all());
+        kwDebug.put("from_categories",    kwr.fromCategories());
+        kwDebug.put("from_llm_keywords",  kwr.fromKeywords());
+        kwDebug.put("from_audience_text", kwr.fromAudience());
+        kwDebug.put("from_objective",     kwr.fromObjective());
+        kwDebug.put("fetch_limit",        fetchLimit);
+        kwDebug.put("target_results",     targetLimit);
+        DebugEvents.emit(debug, sid, "search", "keywords_built",
+            "Keywords Built (" + kwr.all().size() + " terms from 4 sources)", kwDebug);
 
         LinkedHashMap<UUID, MediaItem> pool = new LinkedHashMap<>();
         Set<String> seenKeys = new HashSet<>();
@@ -93,82 +103,116 @@ public class RecEngineService {
         if (!embeddingJson.isBlank()) {
             String formatFilter = request.getFormatPreference() != null
                 ? request.getFormatPreference() : "";
+            List<Object[]> vecRows = mediaRepository.findSimilarByEmbeddingFiltered(
+                embeddingJson, VECTOR_THRESHOLD, fetchLimit, formatFilter);
+            // Build id→score map before resolving to keep similarity values
+            Map<String, Double> scores = new LinkedHashMap<>();
+            for (Object[] row : vecRows) scores.put((String) row[0], ((Number) row[1]).doubleValue());
+
             int before = pool.size();
-            resolveItems(mediaRepository.findSimilarByEmbeddingFiltered(
-                    embeddingJson, VECTOR_THRESHOLD, fetchLimit, formatFilter))
-                .forEach(item -> addToPool(item, pool, seenKeys));
+            resolveItems(vecRows).forEach(item -> addToPool(item, pool, seenKeys));
             log.info("[RecEngine] after vector search (threshold={}, format='{}') → pool={}",
                 VECTOR_THRESHOLD, formatFilter.isEmpty() ? "any" : formatFilter, pool.size());
+
+            // Show top hits with similarity scores
+            List<Map<String, Object>> topHits = pool.values().stream().limit(8).map(item -> {
+                Map<String, Object> h = new LinkedHashMap<>();
+                h.put("title",    item.getTitle());
+                h.put("score",    String.format("%.3f", scores.getOrDefault(item.getId().toString(), 0.0)));
+                h.put("category", item.getCategory() != null ? item.getCategory() : "—");
+                h.put("format",   item.getFormatType() != null ? item.getFormatType() : "—");
+                return h;
+            }).toList();
             DebugEvents.emit(debug, sid, "search", "vector_search",
-                "L1 Vector Search (threshold=" + VECTOR_THRESHOLD + ")",
-                Map.of("threshold", VECTOR_THRESHOLD,
+                "L1 Vector Search — threshold=" + VECTOR_THRESHOLD
+                    + (formatFilter.isEmpty() ? "" : ", format=" + formatFilter),
+                Map.of("threshold",    VECTOR_THRESHOLD,
                        "format_filter", formatFilter.isEmpty() ? "any" : formatFilter,
-                       "new_hits", pool.size() - before,
-                       "pool_size", pool.size()));
+                       "sql_returned",  vecRows.size(),
+                       "new_in_pool",   pool.size() - before,
+                       "pool_size",     pool.size(),
+                       "top_hits",      topHits));
 
             if (pool.size() < targetLimit / 2) {
                 log.info("[RecEngine] sparse vector results, retrying at threshold=0.45");
+                List<Object[]> retryRows = mediaRepository.findSimilarByEmbeddingFiltered(
+                    embeddingJson, 0.45, fetchLimit, formatFilter);
+                Map<String, Double> retryScores = new LinkedHashMap<>();
+                for (Object[] row : retryRows) retryScores.put((String) row[0], ((Number) row[1]).doubleValue());
+
                 before = pool.size();
-                resolveItems(mediaRepository.findSimilarByEmbeddingFiltered(
-                        embeddingJson, 0.45, fetchLimit, formatFilter))
-                    .forEach(item -> addToPool(item, pool, seenKeys));
+                resolveItems(retryRows).forEach(item -> addToPool(item, pool, seenKeys));
                 log.info("[RecEngine] after low-threshold retry → pool={}", pool.size());
+
+                List<Map<String, Object>> retryHits = pool.values().stream()
+                    .filter(item -> retryScores.containsKey(item.getId().toString()))
+                    .limit(8).map(item -> {
+                        Map<String, Object> h = new LinkedHashMap<>();
+                        h.put("title",    item.getTitle());
+                        h.put("score",    String.format("%.3f", retryScores.getOrDefault(item.getId().toString(), 0.0)));
+                        h.put("category", item.getCategory() != null ? item.getCategory() : "—");
+                        return h;
+                    }).toList();
                 DebugEvents.emit(debug, sid, "search", "vector_retry",
-                    "L1 Vector Retry (threshold=0.45 — sparse results)",
-                    Map.of("threshold", 0.45, "new_hits", pool.size() - before, "pool_size", pool.size()));
+                    "L1 Vector Retry — threshold=0.45 (sparse results)",
+                    Map.of("threshold",    0.45,
+                           "sql_returned",  retryRows.size(),
+                           "new_in_pool",   pool.size() - before,
+                           "pool_size",     pool.size(),
+                           "new_hits",      retryHits));
             }
         }
 
         // ── Level 2: keyword × city/region ────────────────────────────────────
-        int before2 = pool.size();
-        searchByKeywords(keywords, request.getRegion(), fetchLimit, pool, seenKeys);
-        if (pool.size() > before2) {
-            DebugEvents.emit(debug, sid, "search", "keyword_region",
-                "L2 Keyword × Region (" + (request.getRegion() != null ? request.getRegion() : "none") + ")",
-                Map.of("keywords", keywords, "region", request.getRegion() != null ? request.getRegion() : "",
-                       "new_hits", pool.size() - before2, "pool_size", pool.size()));
+        if (request.getRegion() != null && !request.getRegion().isBlank()) {
+            searchByKeywordsTracked(kwr.all(), request.getRegion(), fetchLimit,
+                pool, seenKeys, sid, "L2 Keyword × Region", debug);
         }
 
         // ── Level 3: keyword × country ────────────────────────────────────────
         if (pool.size() < targetLimit && request.getCountry() != null && !request.getCountry().isBlank()) {
             String country = request.getCountry();
             int before3 = pool.size();
-            searchByKeywords(keywords, country, fetchLimit, pool, seenKeys);
-            if (!pool.isEmpty() && request.getRegion() != null && !request.getRegion().isBlank()) {
+            searchByKeywordsTracked(kwr.all(), country, fetchLimit,
+                pool, seenKeys, sid, "L3 Keyword × Country", debug);
+            if (pool.size() > before3 && request.getRegion() != null && !request.getRegion().isBlank()) {
                 request.setRelaxationNote(
                     "No results specific to " + request.getRegion() + " — showing " + country + " media");
             }
-            DebugEvents.emit(debug, sid, "search", "keyword_country",
-                "L3 Keyword × Country (" + country + ")",
-                Map.of("keywords", keywords, "country", country,
-                       "new_hits", pool.size() - before3, "pool_size", pool.size()));
         }
 
         // ── Level 4: keyword × no geo ─────────────────────────────────────────
         if (pool.size() < targetLimit) {
             int before4 = pool.size();
-            searchByKeywords(keywords, "", fetchLimit, pool, seenKeys);
-            if (!pool.isEmpty() && (request.getRegion() != null || request.getCountry() != null)) {
+            searchByKeywordsTracked(kwr.all(), "", fetchLimit,
+                pool, seenKeys, sid, "L4 Keyword (no geo)", debug);
+            if (pool.size() > before4 && (request.getRegion() != null || request.getCountry() != null)) {
                 request.setRelaxationNote("Showing top media by traffic — no region-specific results found");
             }
-            DebugEvents.emit(debug, sid, "search", "keyword_global",
-                "L4 Keyword (no geo filter)",
-                Map.of("keywords", keywords, "new_hits", pool.size() - before4, "pool_size", pool.size()));
         }
 
         // ── Level 4a: category padding ─────────────────────────────────────────
         if (pool.size() < targetLimit && request.getCategories() != null) {
             int before4a = pool.size();
+            List<Map<String, Object>> catResults = new ArrayList<>();
             for (String cat : request.getCategories()) {
-                resolveItems(mediaRepository.findByCategory(cat, fetchLimit))
-                    .forEach(item -> addToPool(item, pool, seenKeys));
+                int bCat = pool.size();
+                List<MediaItem> catItems = resolveItems(mediaRepository.findByCategory(cat, fetchLimit));
+                catItems.forEach(item -> addToPool(item, pool, seenKeys));
+                catResults.add(Map.of(
+                    "category", cat,
+                    "sql_returned", catItems.size(),
+                    "new_in_pool",  pool.size() - bCat,
+                    "titles",       catItems.stream().limit(4).map(MediaItem::getTitle).toList()
+                ));
                 if (pool.size() >= targetLimit) break;
             }
             log.info("[RecEngine] after category padding → pool={}", pool.size());
             DebugEvents.emit(debug, sid, "search", "category_pad",
                 "L4a Category Padding",
-                Map.of("categories", request.getCategories(),
-                       "new_hits", pool.size() - before4a, "pool_size", pool.size()));
+                Map.of("new_in_pool", pool.size() - before4a,
+                       "pool_size",   pool.size(),
+                       "per_category", catResults));
         }
 
         // ── Level 4b: top-traffic padding ─────────────────────────────────────
@@ -176,33 +220,82 @@ public class RecEngineService {
             log.info("[RecEngine] pool={} / target={} — padding with top-traffic items",
                 pool.size(), targetLimit);
             int before4b = pool.size();
-            resolveItems(mediaRepository.findTopN(fetchLimit * 2))
-                .forEach(item -> addToPool(item, pool, seenKeys));
+            List<MediaItem> topItems = resolveItems(mediaRepository.findTopN(fetchLimit * 2));
+            topItems.forEach(item -> addToPool(item, pool, seenKeys));
             DebugEvents.emit(debug, sid, "search", "top_traffic",
-                "L4b Top-Traffic Padding (no keyword match)",
-                Map.of("new_hits", pool.size() - before4b, "pool_size", pool.size()));
+                "L4b Top-Traffic Padding (no keyword match found)",
+                Map.of("sql_returned", topItems.size(),
+                       "new_in_pool",  pool.size() - before4b,
+                       "pool_size",    pool.size(),
+                       "titles",       topItems.stream().limit(5).map(MediaItem::getTitle).toList()));
         }
 
         log.info("[RecEngine] {} total candidates (target={})", pool.size(), targetLimit);
+
+        // Final summary with all candidate titles + key data
+        List<Map<String, Object>> allCandidates = pool.values().stream().map(item -> {
+            Map<String, Object> c = new LinkedHashMap<>();
+            c.put("title",    item.getTitle());
+            c.put("category", item.getCategory() != null ? item.getCategory() : "—");
+            c.put("format",   item.getFormatType() != null ? item.getFormatType() : "—");
+            if (item.getCostUsd() != null) c.put("cost_usd", item.getCostUsd());
+            if (item.getSimilarwebVisits() != null)
+                c.put("traffic", item.getSimilarwebVisits() >= 1_000_000
+                    ? String.format("%.1fM", item.getSimilarwebVisits() / 1_000_000.0)
+                    : item.getSimilarwebVisits() >= 1_000
+                        ? String.format("%.0fK", item.getSimilarwebVisits() / 1_000.0)
+                        : String.valueOf(item.getSimilarwebVisits()));
+            c.put("enriched", item.getDescription() != null && !item.getDescription().isBlank());
+            return c;
+        }).toList();
         DebugEvents.emit(debug, sid, "search", "final_pool",
-            "Final Candidate Pool → Enrichment",
-            Map.of("total_candidates", pool.size(), "target_results", targetLimit,
-                   "titles", pool.values().stream().limit(10)
-                       .map(MediaItem::getTitle).toList()));
+            "Final Candidate Pool (" + pool.size() + " → Enrichment LLM)",
+            Map.of("total_candidates", pool.size(),
+                   "target_results",   targetLimit,
+                   "candidates",       allCandidates));
         return new ArrayList<>(pool.values());
     }
 
-    private void searchByKeywords(
+    /**
+     * Keyword search with per-keyword tracing: emits one debug event per level
+     * showing how many items each individual keyword matched.
+     */
+    private void searchByKeywordsTracked(
             List<String> keywords, String geo, int limit,
-            LinkedHashMap<UUID, MediaItem> pool, Set<String> seenKeys) {
+            LinkedHashMap<UUID, MediaItem> pool, Set<String> seenKeys,
+            String sessionId, String levelLabel,
+            Consumer<WebSocketMessage> debug) {
 
         String region = geo != null ? geo : "";
+        int poolBefore = pool.size();
+        List<Map<String, Object>> kwRows = new ArrayList<>();
+
         for (String kw : keywords) {
             if (kw.length() < 4) continue;
+            int before = pool.size();
             List<Object[]> rows = mediaRepository.findByTextAndRegion(kw, region, limit);
-            resolveItems(rows).forEach(item -> addToPool(item, pool, seenKeys));
+            List<MediaItem> found = resolveItems(rows);
+            found.forEach(item -> addToPool(item, pool, seenKeys));
+
+            Map<String, Object> kwEntry = new LinkedHashMap<>();
+            kwEntry.put("keyword",      kw);
+            kwEntry.put("sql_returned", rows.size());
+            kwEntry.put("new_in_pool",  pool.size() - before);
+            kwEntry.put("titles",       found.stream().limit(3).map(MediaItem::getTitle).toList());
+            kwRows.add(kwEntry);
+
             if (pool.size() >= limit) break;
         }
+
+        String geoLabel = region.isBlank() ? "any geo" : region;
+        DebugEvents.emit(debug, sessionId, "search",
+            levelLabel.toLowerCase().replace(" ", "_"),
+            levelLabel + " [" + geoLabel + "]",
+            Map.of("geo",         geoLabel,
+                   "keywords_tried", kwRows.size(),
+                   "new_in_pool", pool.size() - poolBefore,
+                   "pool_size",   pool.size(),
+                   "per_keyword", kwRows));
     }
 
     private static void addToPool(MediaItem item, LinkedHashMap<UUID, MediaItem> pool, Set<String> seenKeys) {
@@ -214,26 +307,26 @@ public class RecEngineService {
         }
     }
 
-    /**
-     * Builds search terms from all available request fields.
-     * Categories come pre-classified by the LLM (canonical names).
-     * Keywords are free-form topic terms extracted by the LLM (crypto, blockchain, etc.).
-     * Audience words add topical signal without rigid mapping.
-     */
-    private List<String> buildKeywords(RecommendationRequestDTO request) {
-        List<String> keywords = new ArrayList<>();
+    private record KeywordsResult(
+        List<String> all,
+        List<String> fromCategories,
+        List<String> fromKeywords,
+        List<String> fromAudience,
+        List<String> fromObjective
+    ) {}
 
-        // 1. Canonical categories from LLM (Technology, Business, etc.)
-        if (request.getCategories() != null) {
-            keywords.addAll(request.getCategories());
-        }
+    private KeywordsResult buildKeywordsDetailed(RecommendationRequestDTO request) {
+        List<String> fromCategories = new ArrayList<>();
+        List<String> fromKeywords   = new ArrayList<>();
+        List<String> fromAudience   = new ArrayList<>();
+        List<String> fromObjective  = new ArrayList<>();
 
-        // 2. Topic keywords extracted by LLM (crypto, blockchain, wallet, etc.)
-        if (request.getKeywords() != null) {
-            keywords.addAll(request.getKeywords());
-        }
+        if (request.getCategories() != null)
+            fromCategories.addAll(request.getCategories());
 
-        // 3. Meaningful words from audience description
+        if (request.getKeywords() != null)
+            fromKeywords.addAll(request.getKeywords());
+
         if (request.getTargetAudienceDescription() != null) {
             Arrays.stream(request.getTargetAudienceDescription().split("[\\s,;]+"))
                 .map(String::toLowerCase)
@@ -241,16 +334,20 @@ public class RecEngineService {
                 .filter(w -> !STOPWORDS.contains(w))
                 .distinct()
                 .limit(3)
-                .forEach(keywords::add);
+                .forEach(fromAudience::add);
         }
 
-        // 4. Campaign objective as last-resort signal
-        if (request.getCampaignObjective() != null && !request.getCampaignObjective().isBlank()) {
-            keywords.add(request.getCampaignObjective());
-        }
+        if (request.getCampaignObjective() != null && !request.getCampaignObjective().isBlank())
+            fromObjective.add(request.getCampaignObjective());
 
-        if (keywords.isEmpty()) keywords.add("");
-        return keywords;
+        List<String> all = new ArrayList<>();
+        all.addAll(fromCategories);
+        all.addAll(fromKeywords);
+        all.addAll(fromAudience);
+        all.addAll(fromObjective);
+        if (all.isEmpty()) all.add("");
+
+        return new KeywordsResult(all, fromCategories, fromKeywords, fromAudience, fromObjective);
     }
 
     private static final Set<String> STOPWORDS = Set.of(
