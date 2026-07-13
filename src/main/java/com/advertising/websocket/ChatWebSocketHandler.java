@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
@@ -54,11 +55,16 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
             case CHAT_MESSAGE -> {
                 log.info("[WS] routing CHAT_MESSAGE to ChatService, session={}", inbound.getSessionId());
+                // Wrap in ConcurrentWebSocketSessionDecorator so debug events and
+                // RECOMMENDATIONS_READY can be sent from different Reactor threads without
+                // colliding on wsSession.sendMessage (which is NOT thread-safe by default).
+                WebSocketSession safe = new ConcurrentWebSocketSessionDecorator(
+                    wsSession, 10_000, 256 * 1024);
                 chatService
                     .processMessage(inbound.getSessionId(), inbound.getContent(), inbound.getPayload())
                     .subscribe(
-                        msg -> { log.info("[WS] sending response type={}", msg.getType()); send(wsSession, msg); },
-                        err -> { log.error("[WS] ChatService error: {}", err.getMessage(), err); sendError(wsSession, err.getMessage()); }
+                        msg -> { log.info("[WS] sending response type={}", msg.getType()); send(safe, msg); },
+                        err -> { log.error("[WS] ChatService error: {}", err.getMessage(), err); sendError(safe, err.getMessage()); }
                     );
             }
 

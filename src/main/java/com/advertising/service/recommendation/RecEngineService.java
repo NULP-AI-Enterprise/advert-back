@@ -462,9 +462,12 @@ public class RecEngineService {
             double score = 0;
             List<String> sigs = new ArrayList<>();
 
-            // Category match
+            // Category match — strong signal since it's the most explicit user constraint
             if (item.getCategory() != null && requestedCats.contains(item.getCategory())) {
                 score += 30; sigs.add("+30_category");
+            } else if (!requestedCats.isEmpty() && item.getCategory() != null) {
+                // Penalise clear mismatch: e.g. Sports outlet when user asked for Technology
+                score -= 10; sigs.add("-10_category_mismatch:" + item.getCategory());
             } else if (item.getCategory() != null) {
                 sigs.add("0_category:" + item.getCategory());
             } else {

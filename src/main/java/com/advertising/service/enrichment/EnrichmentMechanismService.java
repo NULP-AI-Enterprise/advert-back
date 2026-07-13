@@ -92,9 +92,15 @@ public class EnrichmentMechanismService {
         80-100: Excellent — cost, audience, category, format, restrictions all align
         60-79:  Good — most factors align, minor gaps
         40-59:  Partial — useful but not ideal
+        30-39:  Weak — include only when the pool is small
         < 30:   Poor — EXCLUDE (omit from response entirely)
 
         Exclusion threshold is 30. A missed relevant result is worse than one extra mediocre one.
+
+        MINIMUM RESULTS RULE: Always return at least 5 results, even if some score below 40.
+        If fewer than 5 candidates score ≥ 30, include the next-best candidates until you
+        have 5, noting in match_reason "included as best available option" for scores < 30.
+        Return at most 10 items sorted by score descending.
 
         ═══ BUDGET ═══
 
