@@ -251,6 +251,7 @@ public class AgenticLoopService {
                                       String deviceLocation, String deviceLanguage,
                                       String previousContext,
                                       Consumer<WebSocketMessage> debug) {
+        log.info("[Chat] ── STAGE 1/3: ROUTER LLM ────────────────────────");
         log.info("[Agentic] decide() session={}", sessionId);
         return chatHistoryService.getRecentHistory(sessionId, contextWindow)
             .flatMap(history -> {
@@ -449,7 +450,22 @@ public class AgenticLoopService {
             int maxResults = params.path("max_results").asInt(defaultMaxResults);
             builder.maxResults(maxResults > 0 ? maxResults : defaultMaxResults);
 
-            return AgentDecision.search(builder.build(), suggestions);
+            RecommendationRequestDTO req = builder.build();
+            log.info("[Agentic] ══ ROUTER → SEARCH ══ " +
+                "categories={} keywords={} country='{}' region='{}' budget={} format='{}' audience='{}' maxResults={}",
+                req.getCategories(),
+                req.getKeywords(),
+                req.getCountry(),
+                req.getRegion(),
+                req.getBudgetUsd() != null ? "$" + req.getBudgetUsd() : "null",
+                req.getFormatPreference(),
+                req.getTargetAudienceDescription() != null
+                    ? (req.getTargetAudienceDescription().length() > 80
+                        ? req.getTargetAudienceDescription().substring(0, 80) + "…"
+                        : req.getTargetAudienceDescription())
+                    : "null",
+                req.getMaxResults());
+            return AgentDecision.search(req, suggestions);
         }
 
         return AgentDecision.clarify(json.path("question").asText(

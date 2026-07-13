@@ -107,7 +107,8 @@ management:
 logging:
   level:
     com.advertising: DEBUG
-    org.hibernate.SQL: DEBUG
-    org.hibernate.orm.jdbc.bind: TRACE
+    # Hibernate SQL noise disabled — app already logs all DB calls with [RecEngine][DB] prefixes
+    org.hibernate.SQL: WARN
+    org.hibernate.orm.jdbc.bind: WARN
     org.springframework.web.socket: WARN
     org.springframework.web.reactive.function.client: WARN

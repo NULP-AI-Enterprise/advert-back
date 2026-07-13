@@ -89,6 +89,11 @@ public class ChatService {
         log.info("[Chat] previous context: {} (session={})",
             previousContext != null ? previousContext.length() + " chars" : "none", sessionId);
 
+        log.info("[Chat] ══════════════════════════════════════════════════════");
+        log.info("[Chat] NEW REQUEST session={} preview='{}'",
+            sessionId, userContent.length() > 100 ? userContent.substring(0, 100) + "…" : userContent);
+        log.info("[Chat] ══════════════════════════════════════════════════════");
+
         Flux<WebSocketMessage> mainFlux = Mono.fromRunnable(() -> doSave(sessionId, ChatMessage.MessageRole.user, userContent))
             .subscribeOn(Schedulers.boundedElastic())
             .then(Mono.fromRunnable(() -> chatHistoryService.invalidateCache(sessionId))
@@ -141,11 +146,14 @@ public class ChatService {
             s.request().getFormatPreference(),
             s.request().getMaxResults());
 
+        log.info("[Chat] ── STAGE 2/3: SQL SEARCH ──────────────────────────");
         return recEngineService.findCandidates(s.request(), debug)
-            .doOnNext(candidates -> log.info("[Chat] RecEngine returned {} candidates session={}",
-                candidates.size(), sessionId))
+            .doOnNext(candidates -> {
+                log.info("[Chat] ── STAGE 3/3: SCORING LLM ─────────────────────");
+                log.info("[Chat] RecEngine → {} candidates → sending to scoring LLM session={}", candidates.size(), sessionId);
+            })
             .flatMap(candidates -> enrichmentMechanismService.enrich(candidates, s.request(), debug))
-            .doOnNext(recs -> log.info("[Chat] Enrichment returned {} recommendations session={}",
+            .doOnNext(recs -> log.info("[Chat] ── DONE: {} recommendations returned session={} ──────",
                 recs.getRecommendations().size(), sessionId))
             .flatMapMany(recs -> {
                 // Save context to Redis for next query and marketing plan

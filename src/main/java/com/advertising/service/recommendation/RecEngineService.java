@@ -627,15 +627,19 @@ public class RecEngineService {
                 continue;
             }
             int before = pool.size();
-            log.debug("[RecEngine][FTS][DB] findByTextAndRegion → keyword='{}' region='{}' limit={}",
-                kw, region.isEmpty() ? "any" : region, perQueryLimit);
+            String sqlDesc = region.isEmpty()
+                ? "search_vector @@ tsquery('" + kw + "')"
+                : "search_vector @@ tsquery('" + kw + "') AND (country|audience|metrics) LIKE '%" + region + "%'";
+            log.info("[RecEngine][FTS] SQL: {} (limit={})", sqlDesc, perQueryLimit);
 
             List<Object[]> rows = mediaRepository.findByTextAndRegion(kw, region, perQueryLimit);
-            log.debug("[RecEngine][FTS][DB] findByTextAndRegion ← {} rows for keyword='{}'", rows.size(), kw);
 
             List<MediaItem> found = resolveItems(rows);
             found.forEach(item -> addToPool(item, pool, seenKeys));
             int newItems = pool.size() - before;
+
+            log.info("[RecEngine][FTS] '{}' geo='{}' → {} rows from DB, {} new in pool ({}/{})",
+                kw, region.isEmpty() ? "any" : region, rows.size(), newItems, pool.size(), poolCap);
 
             Map<String, Object> kwEntry = new LinkedHashMap<>();
             kwEntry.put("keyword",      kw);
@@ -644,11 +648,6 @@ public class RecEngineService {
             kwEntry.put("titles",       found.stream().limit(3).map(MediaItem::getTitle).toList());
             kwRows.add(kwEntry);
             kwTried++;
-
-            if (newItems > 0) {
-                log.debug("[RecEngine][FTS] keyword='{}' → sql={} new={} pool={}",
-                    kw, rows.size(), newItems, pool.size());
-            }
 
             // Stop when pool is full enough — use poolCap, NOT perQueryLimit
             // (the old bug was: if (pool.size() >= limit) break; where limit = fetchLimit = 40,

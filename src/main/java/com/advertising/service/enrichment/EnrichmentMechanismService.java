@@ -229,18 +229,22 @@ public class EnrichmentMechanismService {
         EventDateContext eventCtx = parseEventDate(request.getEventDate());
 
         String userPrompt = buildUserPrompt(rawCandidates, request, eventCtx);
-        log.info("[Enrichment] user_prompt_chars={} candidates={} session={}",
-            userPrompt.length(), rawCandidates.size(), sid);
-        log.debug("[Enrichment] user_prompt_preview: '{}'",
-            userPrompt.length() > 800 ? userPrompt.substring(0, 800) + "…" : userPrompt);
+        int totalChars = SYSTEM_PROMPT.length() + userPrompt.length();
+        int estTokens  = totalChars / 4;
+        int avgCharsPerItem = userPrompt.length() / Math.max(1, rawCandidates.size());
+        log.info("[Enrichment] ══ TOKEN ESTIMATE ══ ~{} tokens ({} items × ~{} chars/item | system={} chars)",
+            estTokens, rawCandidates.size(), avgCharsPerItem, SYSTEM_PROMPT.length());
+        log.info("[Enrichment] campaign brief preview: '{}'",
+            userPrompt.length() > 400 ? userPrompt.substring(0, 400) + "…" : userPrompt);
+        log.debug("[Enrichment] full user_prompt chars={}", userPrompt.length());
 
         List<Map<String, String>> messages = List.of(
             Map.of("role", "system", "content", SYSTEM_PROMPT),
             Map.of("role", "user",   "content", userPrompt)
         );
 
-        log.info("[Enrichment] → scoring LLM system_chars={} user_chars={} schema=enrichment_response",
-            SYSTEM_PROMPT.length(), userPrompt.length());
+        log.info("[Enrichment] → scoring LLM system_chars={} user_chars={} est_tokens=~{} schema=enrichment_response",
+            SYSTEM_PROMPT.length(), userPrompt.length(), estTokens);
 
         return openAIService.chatCompletionStructured(messages, "enrichment_response", enrichmentSchema)
             .doOnNext(json -> {
@@ -271,11 +275,25 @@ public class EnrichmentMechanismService {
                 log.info("[Enrichment] ← LLM returned {} recommendations from {} candidates " +
                     "(excellent≥80: {} good≥60: {} partial≥30: {} excluded<30: {})",
                     scores.size(), rawCandidates.size(), excellent, good, partial, excluded);
+
+                String scoresLine = scores.stream()
+                    .map(s -> String.valueOf(s.get("score")))
+                    .collect(java.util.stream.Collectors.joining(", "));
+                log.info("[Enrichment] ══ SCORES ══ [{}]", scoresLine);
+
+                if (!scores.isEmpty()) {
+                    Map<String, Object> top = scores.get(0);
+                    String topReason = top.get("reason") instanceof String r
+                        ? (r.length() > 160 ? r.substring(0, 160) + "…" : r) : "";
+                    log.info("[Enrichment] top match: '{}' score={} reason='{}'",
+                        top.getOrDefault("title", top.get("id")), top.get("score"), topReason);
+                }
+
                 log.info("[Enrichment] reasoning: '{}'",
                     reasoning.length() > 300 ? reasoning.substring(0, 300) + "…" : reasoning);
 
-                // Log each scored item
-                scores.forEach(s -> log.info("[Enrichment] score={} title='{}' format='{}' reason_preview='{}'",
+                // Per-item detail at DEBUG — visible when needed, not in default INFO view
+                scores.forEach(s -> log.debug("[Enrichment] score={} title='{}' format='{}' reason='{}'",
                     s.get("score"),
                     s.getOrDefault("title", s.get("id")),
                     s.get("format"),
