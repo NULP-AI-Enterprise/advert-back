@@ -17,4 +17,6 @@ public interface ChatMessageRepository extends JpaRepository<ChatMessage, UUID> 
 
     @Query("SELECT m FROM ChatMessage m WHERE m.session.id = :sessionId ORDER BY m.createdAt DESC LIMIT :limit")
     List<ChatMessage> findLatestBySessionId(@Param("sessionId") UUID sessionId, @Param("limit") int limit);
+
+    long countBySessionId(UUID sessionId);
 }

@@ -58,6 +58,15 @@ public class ChatService {
         var debug = (java.util.function.Consumer<WebSocketMessage>)
             msg -> debugSink.tryEmitNext(msg);
 
+        // Check before saving: is this the first user message? Used for auto-titling.
+        boolean isFirstMessage = false;
+        try {
+            isFirstMessage = messageRepository.countBySessionId(UUID.fromString(sessionId)) == 0;
+        } catch (Exception e) {
+            log.debug("[Chat] could not check message count for auto-title: {}", e.getMessage());
+        }
+        final boolean autoTitle = isFirstMessage;
+
         // Extract device context from payload
         String deviceLocation = null;
         String deviceLanguage = null;
@@ -104,7 +113,28 @@ public class ChatService {
                     .flatMapMany(decision -> handleDecision(sessionId, decision, debug))
             )
             .doOnError(e -> log.error("[Chat] pipeline error: {}", e.getMessage(), e))
-            .doFinally(signal -> debugSink.tryEmitComplete());
+            .doFinally(signal -> {
+                if (autoTitle) {
+                    generateSessionTitle(sessionId, userContent)
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe(
+                            title -> {
+                                debugSink.tryEmitNext(WebSocketMessage.builder()
+                                    .type(WebSocketMessage.MessageType.SESSION_TITLE)
+                                    .sessionId(sessionId)
+                                    .content(title)
+                                    .build());
+                                debugSink.tryEmitComplete();
+                            },
+                            err -> {
+                                log.warn("[Chat] auto-title generation failed: {}", err.getMessage());
+                                debugSink.tryEmitComplete();
+                            }
+                        );
+                } else {
+                    debugSink.tryEmitComplete();
+                }
+            });
 
         return Flux.merge(debugSink.asFlux(), mainFlux);
     }
@@ -417,6 +447,32 @@ public class ChatService {
             log.debug("[Chat] no previous context for session {}", sessionId);
         }
         return null;
+    }
+
+    private Mono<String> generateSessionTitle(String sessionId, String userContent) {
+        String preview = userContent.length() > 200 ? userContent.substring(0, 200) : userContent;
+        return openAIService.chatCompletion(List.of(
+            Map.of("role", "system", "content",
+                "Generate a short 4-6 word title for an advertising media planning conversation. " +
+                "The title should describe what the user wants to advertise or find. " +
+                "Return ONLY the title text — no quotes, no period, no extra words."),
+            Map.of("role", "user", "content", preview)
+        ))
+        .map(raw -> {
+            String title = raw.trim().replaceAll("[\"'.]$", "").trim();
+            return title.length() > 60 ? title.substring(0, 57) + "..." : title;
+        })
+        .doOnSuccess(title -> {
+            try {
+                ChatSession session = sessionRepository.findById(UUID.fromString(sessionId)).orElseThrow();
+                session.setTitle(title);
+                sessionRepository.save(session);
+                log.info("[Chat] auto-titled session={} title='{}'", sessionId, title);
+            } catch (Exception e) {
+                log.warn("[Chat] failed to persist auto-title: {}", e.getMessage());
+            }
+        })
+        .onErrorReturn(userContent.length() > 50 ? userContent.substring(0, 47) + "..." : userContent);
     }
 
     private void doSave(String sessionId, ChatMessage.MessageRole role, String content) {

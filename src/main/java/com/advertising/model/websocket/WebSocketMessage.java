@@ -41,6 +41,9 @@ public class WebSocketMessage {
         PONG,
 
         // Debug tracing (server → client, not persisted)
-        DEBUG_EVENT
+        DEBUG_EVENT,
+
+        // Auto-generated session title after first message
+        SESSION_TITLE
     }
 }
