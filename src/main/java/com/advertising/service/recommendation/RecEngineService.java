@@ -286,8 +286,9 @@ public class RecEngineService {
             countFts += added;
             log.info("[RecEngine][L3] after keyword×country → new_in_pool={} pool={}/{}", added, pool.size(), poolCap);
             if (added > 0 && request.getRegion() != null && !request.getRegion().isBlank()) {
-                request.setRelaxationNote(
-                    "No results specific to " + request.getRegion() + " — showing " + country + " media");
+                if (request.getRelaxationNote() == null)
+                    request.setRelaxationNote(
+                        "No results specific to " + request.getRegion() + " — showing " + country + " media");
             }
         } else if (pool.size() >= poolCap) {
             log.info("[RecEngine][L3] skipped — pool already full ({}/{})", pool.size(), poolCap);
@@ -305,7 +306,8 @@ public class RecEngineService {
             countFts += added;
             log.info("[RecEngine][L4] after keyword(no geo) → new_in_pool={} pool={}/{}", added, pool.size(), poolCap);
             if (added > 0 && (request.getRegion() != null || request.getCountry() != null)) {
-                request.setRelaxationNote("Showing top media by traffic — no region-specific results found");
+                if (request.getRelaxationNote() == null)
+                    request.setRelaxationNote("Showing top media by traffic — no region-specific results found");
             }
         } else {
             log.info("[RecEngine][L4] skipped — pool full ({}/{})", pool.size(), poolCap);
@@ -410,9 +412,17 @@ public class RecEngineService {
         int enrichBatchSize = Math.max(targetLimit * 6, 60);
         List<MediaItem> ranked = preRankAndTrim(new ArrayList<>(pool.values()), request, enrichBatchSize, debug, sid);
 
-        log.info("[RecEngine] → enrichment LLM: {} candidates (trimmed from {} pool, target={})",
-            ranked.size(), pool.size(), targetLimit);
-        return ranked;
+        // ── Domain diversity cap — max 2 entries per outlet ───────────────────
+        // Without this the same outlet (e.g. Minfin.com.ua) fills 4 of the 60
+        // LLM slots because it has 4 format types, wasting scoring capacity.
+        // Cap: 2 per domain so the LLM sees variety; aim for targetLimit × 4 items.
+        int maxPerDomain     = 2;
+        int diverseTargetSize = Math.max(targetLimit * 4, 40);
+        List<MediaItem> diverse = deduplicateByDomain(ranked, maxPerDomain, diverseTargetSize, debug, sid);
+
+        log.info("[RecEngine] → enrichment LLM: {} candidates (pool={} ranked={} after domain-dedup, target={})",
+            diverse.size(), pool.size(), ranked.size(), targetLimit);
+        return diverse;
     }
 
     /**
@@ -677,6 +687,76 @@ public class RecEngineService {
                    "pool_size",       pool.size(),
                    "pool_cap",        poolCap,
                    "per_keyword",     kwRows));
+    }
+
+    // ── Domain diversity deduplication ─────────────────────────────────────────
+
+    /**
+     * Keeps the top-ranked items while capping how many entries per outlet domain
+     * are included. The input list must already be sorted best-first (preRankAndTrim output).
+     * Emits a debug event with domain distribution stats.
+     */
+    private List<MediaItem> deduplicateByDomain(List<MediaItem> ranked, int maxPerDomain,
+                                                  int targetSize,
+                                                  Consumer<WebSocketMessage> debug, String sid) {
+        Map<String, Integer> domainCount = new LinkedHashMap<>();
+        List<MediaItem> result   = new ArrayList<>();
+        List<MediaItem> overflow = new ArrayList<>(); // items suppressed by cap
+
+        for (MediaItem item : ranked) {
+            String domain = extractDomain(item);
+            int count = domainCount.getOrDefault(domain, 0);
+            if (count < maxPerDomain) {
+                result.add(item);
+                domainCount.put(domain, count + 1);
+            } else {
+                overflow.add(item);
+            }
+            if (result.size() >= targetSize) break;
+        }
+
+        int uniqueDomains = domainCount.size();
+        int suppressed    = ranked.size() - result.size();
+
+        log.info("[RecEngine][DomainDedup] in={} out={} unique_domains={} suppressed={} maxPerDomain={}",
+            ranked.size(), result.size(), uniqueDomains, suppressed, maxPerDomain);
+
+        // Top domains by entry count — shows which outlets dominated pre-dedup
+        Map<String, Long> domainDist = ranked.stream()
+            .collect(Collectors.groupingBy(RecEngineService::extractDomain, Collectors.counting()));
+        List<Map<String, Object>> topDomains = domainDist.entrySet().stream()
+            .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+            .limit(10)
+            .map(e -> Map.<String, Object>of("domain", e.getKey(), "entries", e.getValue()))
+            .toList();
+
+        DebugEvents.emit(debug, sid, "search", "domain_dedup",
+            "Domain Dedup: " + ranked.size() + " → " + result.size() + " (" + uniqueDomains + " unique outlets)",
+            Map.of("in",            ranked.size(),
+                   "out",           result.size(),
+                   "unique_domains", uniqueDomains,
+                   "suppressed",    suppressed,
+                   "max_per_domain", maxPerDomain,
+                   "top_domains",   topDomains));
+
+        return result;
+    }
+
+    private static String extractDomain(MediaItem item) {
+        if (item.getUrl() == null || item.getUrl().isBlank()) return item.getId().toString();
+        try {
+            String url = item.getUrl();
+            if (!url.startsWith("http")) url = "https://" + url;
+            String host = new java.net.URI(url).getHost();
+            if (host == null) return item.getUrl();
+            // Strip "www." prefix so www.minfin.com.ua == minfin.com.ua
+            return host.startsWith("www.") ? host.substring(4) : host;
+        } catch (Exception e) {
+            String url = item.getUrl().replaceFirst("^https?://", "");
+            int slash = url.indexOf('/');
+            String host = slash > 0 ? url.substring(0, slash) : url;
+            return host.startsWith("www.") ? host.substring(4) : host;
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────

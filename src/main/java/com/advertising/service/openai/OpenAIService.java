@@ -45,8 +45,11 @@ public class OpenAIService {
     // Tier 1 OpenAI accounts hit 30K TPM limits; a short wait usually clears the window.
     private static final Retry RATE_LIMIT_RETRY = Retry.backoff(3, Duration.ofSeconds(2))
         .maxBackoff(Duration.ofSeconds(16))
-        .filter(t -> t instanceof WebClientResponseException e && e.getStatusCode().value() == 429)
-        .doBeforeRetry(signal -> log.warn("[OpenAI] 429 rate-limit — retry #{} after backoff",
+        .filter(t -> t instanceof WebClientResponseException e
+            && (e.getStatusCode().value() == 429 || e.getStatusCode().is5xxServerError()))
+        .doBeforeRetry(signal -> log.warn("[OpenAI] {} — retry #{} after backoff",
+            signal.failure() instanceof WebClientResponseException ex
+                ? "HTTP " + ex.getStatusCode().value() : "transient error",
             signal.totalRetries() + 1));
 
     /**

@@ -112,8 +112,9 @@ public class AgenticLoopService {
         ═══ STRICT RULES ═══
 
         DISMISSAL: Treat user indifference expressions ("any", "skip", "no preference",
-        "does not matter", "no budget", "flexible", "not sure") as explicit NULL values
-        for that field. Set it to null and proceed — never ask about it again.
+        "does not matter", "no budget", "flexible", "not sure", "nationwide", "whole country",
+        "anywhere") as explicit NULL values for that field. Set it to null and proceed —
+        never ask about it again.
 
         REPEAT SIGNAL: If the user says "already provided", "I told you", "you already asked",
         or similar — look through the full conversation history to extract the answer.
@@ -142,13 +143,29 @@ public class AgenticLoopService {
         - The product/service being advertised (REQUIRED)
         - ANY TWO of: audience, location, objective, budget, format
         Default objective: "awareness". Missing optional fields → null.
+        IP_COUNTRY (if injected) counts as satisfying the "location" requirement.
 
-        CLARIFY PRIORITY — when you must ask ONE question (pre-search OR post-results refinement):
-        Pre-search:
-          1. Budget AND format both unknown → ask both together.
+        ═══ IP-DETECTED COUNTRY ═══
+
+        When IP_COUNTRY is injected below this prompt:
+        - Use it as the default country if the user has not explicitly stated one.
+        - User-stated country always overrides IP_COUNTRY.
+        - Never mention "IP", "detection", or "your location" to the user — use it silently.
+        - IP_COUNTRY satisfies the location requirement for EAGER SEARCH.
+
+        ═══ CLARIFY PRIORITY ═══
+
+        When you must ask ONE question (pre-search, CURRENT_CLARIFY_COUNT < 3):
+          1. Budget AND format both unknown → ask both together in one question.
           2. Only budget unknown → ask budget.
           3. Only format unknown → ask format.
-          4. Otherwise ask the single most impactful missing field.
+          4. Country is known (from IP_COUNTRY or user) AND no city/region mentioned →
+             ask: "Any specific city or region to target within [country], or search nationwide?"
+             Only ask this AFTER budget and format are resolved or null.
+             If user dismisses ("nationwide", "anywhere", "any city", "no preference") →
+             set region=null, proceed with country only.
+          5. Otherwise ask the single most impactful missing field.
+
         Post-results (when RESULTS_SHOWN=true, user is vague):
           Ask ONE specific question that would most improve the results, e.g.:
           "Are you targeting hiring (job candidates) or sales (B2B clients)?",
@@ -161,7 +178,7 @@ public class AgenticLoopService {
         1. Product/service — scan every user message.
         2. Audience — age, interests, demographics; vague hints count.
         3. Objective — explicit or strongly implied.
-        4. Region/location — any message, including device context.
+        4. Region/location — any message, device context, or IP_COUNTRY.
         5. Budget — any currency or format.
         6. Format preference — Article / Press Release / Paid news / Video.
         7. Event date — extract if this is a timed event.
@@ -227,11 +244,12 @@ public class AgenticLoopService {
         ═══ GEO ═══
 
         region: most specific location (city/district). country: the country. Both nullable.
+        When IP_COUNTRY is available and no country stated → set country = IP_COUNTRY, region = null.
 
         ═══ LANGUAGE DETECTION ═══
 
         If the user writes in a non-English language AND no country has been explicitly set,
-        infer the most likely country as a soft default:
+        infer the most likely country as a soft default (IP_COUNTRY takes priority if present):
           Ukrainian Cyrillic (letters і, ї, є, щ or words "для", "або", "що", "це", "та") → "Ukraine"
           Russian Cyrillic (ё, ъ, ы dominant, no і/ї/є) → "Russia"
           French → "France"
@@ -249,7 +267,7 @@ public class AgenticLoopService {
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage,
                                       String deviceLocation, String deviceLanguage,
-                                      String previousContext,
+                                      String previousContext, String ipCountry,
                                       Consumer<WebSocketMessage> debug) {
         log.info("[Chat] ── STAGE 1/3: ROUTER LLM ────────────────────────");
         log.info("[Agentic] decide() session={}", sessionId);
@@ -257,6 +275,7 @@ public class AgenticLoopService {
             .flatMap(history -> {
                 long clarifyCount = history.stream()
                     .filter(m -> "assistant".equalsIgnoreCase(m.getRole().name()))
+                    .filter(m -> m.getContent() != null && m.getContent().trim().endsWith("?"))
                     .count();
                 boolean resultsShown = previousContext != null && !previousContext.isBlank();
                 log.info("[Agentic] history={} msgs, clarifyCount={}, calling OpenAI", history.size(), clarifyCount);
@@ -275,7 +294,7 @@ public class AgenticLoopService {
                     "Router → LLM (preparing request)", inputData);
 
                 List<Map<String, String>> messages = buildMessageList(
-                    history, userMessage, deviceLocation, deviceLanguage, previousContext, clarifyCount);
+                    history, userMessage, deviceLocation, deviceLanguage, previousContext, clarifyCount, ipCountry);
 
                 log.info("[Agentic] → router LLM total_messages={} history_turns={} clarify_count={} results_shown={}",
                     messages.size(), history.size(), clarifyCount, resultsShown);
@@ -332,12 +351,12 @@ public class AgenticLoopService {
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage,
                                       String deviceLocation, String deviceLanguage,
-                                      String previousContext) {
-        return decide(sessionId, userMessage, deviceLocation, deviceLanguage, previousContext, DebugEvents.NOOP);
+                                      String previousContext, String ipCountry) {
+        return decide(sessionId, userMessage, deviceLocation, deviceLanguage, previousContext, ipCountry, DebugEvents.NOOP);
     }
 
     public Mono<AgentDecision> decide(String sessionId, String userMessage) {
-        return decide(sessionId, userMessage, null, null, null, DebugEvents.NOOP);
+        return decide(sessionId, userMessage, null, null, null, null, DebugEvents.NOOP);
     }
 
     // ── Internal ────────────────────────────────────────────────────────────────
@@ -345,7 +364,7 @@ public class AgenticLoopService {
     private List<Map<String, String>> buildMessageList(
             List<ChatMessage> history, String newUserMessage,
             String deviceLocation, String deviceLanguage,
-            String previousContext, long clarifyCount) {
+            String previousContext, long clarifyCount, String ipCountry) {
 
         StringBuilder systemContent = new StringBuilder(ROUTER_SYSTEM_PROMPT);
 
@@ -356,6 +375,11 @@ public class AgenticLoopService {
         systemContent.append("\nRESULTS_SHOWN: ").append(resultsShown);
         if (clarifyCount >= 3 && !resultsShown) {
             systemContent.append(" ← PRE-SEARCH LIMIT REACHED. Set action=\"search\" now.");
+        }
+
+        if (ipCountry != null && !ipCountry.isBlank()) {
+            systemContent.append("\nIP_COUNTRY: ").append(ipCountry)
+                .append(" — detected from request IP. Use as country default if user hasn't specified one. Never mention IP detection to the user.");
         }
 
         if ((deviceLocation != null && !deviceLocation.isBlank())
@@ -419,9 +443,11 @@ public class AgenticLoopService {
 
             JsonNode ageNode = params.path("age_range");
             if (!ageNode.isMissingNode() && !ageNode.isNull()) {
+                JsonNode minNode = ageNode.path("min");
+                JsonNode maxNode = ageNode.path("max");
                 builder.ageRange(RecommendationRequestDTO.AgeRange.builder()
-                    .min(ageNode.path("min").asInt(0))
-                    .max(ageNode.path("max").asInt(0))
+                    .min((!minNode.isNull() && !minNode.isMissingNode()) ? minNode.asInt() : null)
+                    .max((!maxNode.isNull() && !maxNode.isMissingNode()) ? maxNode.asInt() : null)
                     .build());
             }
 

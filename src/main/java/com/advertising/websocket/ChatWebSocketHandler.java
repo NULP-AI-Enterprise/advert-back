@@ -2,6 +2,7 @@ package com.advertising.websocket;
 
 import com.advertising.model.websocket.WebSocketMessage;
 import com.advertising.service.chat.ChatService;
+import com.advertising.service.geo.IpGeoService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,15 +22,38 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ChatWebSocketHandler extends TextWebSocketHandler {
 
     private final ChatService chatService;
+    private final IpGeoService ipGeoService;
     private final ObjectMapper objectMapper;
 
-    // sessionId → WebSocketSession for sending back responses
+    // wsSessionId → raw WebSocketSession (for bookkeeping)
     private final ConcurrentHashMap<String, WebSocketSession> activeSessions = new ConcurrentHashMap<>();
+    // wsSessionId → thread-safe decorator, created once per connection
+    private final ConcurrentHashMap<String, WebSocketSession> safeSessions = new ConcurrentHashMap<>();
+    // wsSessionId → IP-detected country (populated asynchronously after connection)
+    private final ConcurrentHashMap<String, String> sessionCountry = new ConcurrentHashMap<>();
 
     @Override
     public void afterConnectionEstablished(WebSocketSession wsSession) {
-        activeSessions.put(wsSession.getId(), wsSession);
-        log.info("WebSocket connection established: {}", wsSession.getId());
+        String id = wsSession.getId();
+        activeSessions.put(id, wsSession);
+
+        // One thread-safe decorator per connection — shared across all messages on this connection
+        safeSessions.put(id, new ConcurrentWebSocketSessionDecorator(wsSession, 10_000, 512 * 1024));
+
+        // Resolve IP → country in the background; does not block the connection handshake
+        String ip = IpGeoService.extractIp(wsSession.getHandshakeHeaders(), wsSession.getRemoteAddress());
+        if (ip != null) {
+            ipGeoService.getCountry(ip)
+                .subscribe(
+                    country -> {
+                        sessionCountry.put(id, country);
+                        log.info("[WS] GeoIP: {} → {}", ip, country);
+                    },
+                    err -> log.debug("[WS] GeoIP error for {}: {}", ip, err.getMessage())
+                );
+        }
+
+        log.info("WebSocket connection established: {}", id);
     }
 
     @Override
@@ -47,7 +71,9 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
         log.info("[WS] type={} sessionId={} content={}",
             inbound.getType(), inbound.getSessionId(),
-            inbound.getContent() != null ? inbound.getContent().substring(0, Math.min(80, inbound.getContent().length())) : null);
+            inbound.getContent() != null
+                ? inbound.getContent().substring(0, Math.min(80, inbound.getContent().length()))
+                : null);
 
         switch (inbound.getType()) {
             case PING -> send(wsSession, WebSocketMessage.builder()
@@ -55,13 +81,10 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
             case CHAT_MESSAGE -> {
                 log.info("[WS] routing CHAT_MESSAGE to ChatService, session={}", inbound.getSessionId());
-                // Wrap in ConcurrentWebSocketSessionDecorator so debug events and
-                // RECOMMENDATIONS_READY can be sent from different Reactor threads without
-                // colliding on wsSession.sendMessage (which is NOT thread-safe by default).
-                WebSocketSession safe = new ConcurrentWebSocketSessionDecorator(
-                    wsSession, 10_000, 256 * 1024);
+                WebSocketSession safe = safeSessions.getOrDefault(wsSession.getId(), wsSession);
+                String ipCountry = sessionCountry.get(wsSession.getId());
                 chatService
-                    .processMessage(inbound.getSessionId(), inbound.getContent(), inbound.getPayload())
+                    .processMessage(inbound.getSessionId(), inbound.getContent(), inbound.getPayload(), ipCountry)
                     .subscribe(
                         msg -> { log.info("[WS] sending response type={}", msg.getType()); send(safe, msg); },
                         err -> { log.error("[WS] ChatService error: {}", err.getMessage(), err); sendError(safe, err.getMessage()); }
@@ -74,14 +97,20 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionClosed(WebSocketSession wsSession, CloseStatus status) {
-        activeSessions.remove(wsSession.getId());
-        log.info("WebSocket closed: {} — {}", wsSession.getId(), status);
+        String id = wsSession.getId();
+        activeSessions.remove(id);
+        safeSessions.remove(id);
+        sessionCountry.remove(id);
+        log.info("WebSocket closed: {} — {}", id, status);
     }
 
     @Override
     public void handleTransportError(WebSocketSession wsSession, Throwable exception) {
         log.error("WebSocket transport error for session {}", wsSession.getId(), exception);
-        activeSessions.remove(wsSession.getId());
+        String id = wsSession.getId();
+        activeSessions.remove(id);
+        safeSessions.remove(id);
+        sessionCountry.remove(id);
     }
 
     private void send(WebSocketSession wsSession, WebSocketMessage message) {

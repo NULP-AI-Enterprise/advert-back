@@ -48,7 +48,7 @@ public class ChatService {
     private static final String REC_CONTEXT_PREFIX = "rec:last:";
     private static final Duration REC_CONTEXT_TTL = Duration.ofHours(24);
 
-    public Flux<WebSocketMessage> processMessage(String sessionId, String userContent, Object rawPayload) {
+    public Flux<WebSocketMessage> processMessage(String sessionId, String userContent, Object rawPayload, String ipCountry) {
         log.info("[Chat] processMessage session={} msg_len={} preview='{}'",
             sessionId, userContent.length(),
             userContent.length() > 150 ? userContent.substring(0, 150) + "…" : userContent);
@@ -109,7 +109,7 @@ public class ChatService {
                 .subscribeOn(Schedulers.boundedElastic()))
             .thenMany(
                 agenticLoopService.decide(sessionId, userContent, finalDeviceLocation, finalDeviceLanguage,
-                        previousContext, debug)
+                        previousContext, ipCountry, debug)
                     .flatMapMany(decision -> handleDecision(sessionId, decision, debug))
             )
             .doOnError(e -> log.error("[Chat] pipeline error: {}", e.getMessage(), e))
@@ -141,7 +141,7 @@ public class ChatService {
 
     // Backward-compatible overload
     public Flux<WebSocketMessage> processMessage(String sessionId, String userContent) {
-        return processMessage(sessionId, userContent, null);
+        return processMessage(sessionId, userContent, null, null);
     }
 
     private Flux<WebSocketMessage> handleDecision(String sessionId, AgenticLoopService.AgentDecision decision,
